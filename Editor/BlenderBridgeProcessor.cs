@@ -108,7 +108,7 @@ public static class BlenderBridgeProcessor
         }
 
         string arguments = $"--python \"{pythonScript}\" -- \"{modelFullPath}\"";
-        StartBlenderWithArguments(arguments);
+        StartBlenderWithArguments(arguments, pythonScript);
     }
 
     /// <summary>
@@ -215,7 +215,7 @@ public static class BlenderBridgeProcessor
         }
     }
 
-    private static void StartBlenderWithArguments(string arguments)
+    private static void StartBlenderWithArguments(string arguments, string injectorScriptPath)
     {
         System.Diagnostics.Process process = new System.Diagnostics.Process();
         System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
@@ -230,6 +230,10 @@ public static class BlenderBridgeProcessor
             Arguments = arguments
         };
         startInfo.EnvironmentVariables["BRIDGE_BLENDER_PORT"] = BridgeListenPort.ToString();
+        if (!string.IsNullOrEmpty(injectorScriptPath))
+        {
+            startInfo.EnvironmentVariables["BLENDER_BRIDGE_INJECTOR"] = injectorScriptPath;
+        }
         if (DEBUG)
         {
             startInfo.EnvironmentVariables["BLENDER_BRIDGE_PROFILE"] = "1";

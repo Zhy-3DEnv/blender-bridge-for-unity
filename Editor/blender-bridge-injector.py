@@ -1,4 +1,6 @@
 import bpy
+import importlib.util
+import math
 import os
 import queue
 import socket
@@ -23,6 +25,8 @@ _FORCE_BUILTIN_FBX = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX", "").lower() in (
 # If set, Ctrl+S still uses bpy.ops.export_scene.fbx instead of better_export.fbx
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
+_VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
+_BRIDGE_SCRIPT_VERSION = "2.2"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -67,7 +71,7 @@ def _bridge_process_queue():
     except queue.Empty:
         return 0.05
     try:
-        UnityModelExporter(path).load_model()
+        _run_unity_load(path)
     except Exception as ex:
         print(f"BLENDER_BRIDGE_ERROR: queued import failed for {path!r}: {ex}")
     return 0.05
@@ -138,6 +142,155 @@ def _ensure_bridge_server():
         _bridge_timer_registered = True
 
 
+def _read_unity_meta_normal_settings(asset_path: str) -> tuple[str, float]:
+    """
+    Read Unity ModelImporter normal settings from the .meta next to the FBX.
+    normalImportMode: 0=Import, 1=Calculate, 2=None
+    """
+    import_mode = "Import"
+    smooth_angle = 60.0
+    meta_path = asset_path + ".meta"
+    if not os.path.isfile(meta_path):
+        return import_mode, smooth_angle
+
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("normalImportMode:"):
+                    try:
+                        mode_val = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        continue
+                    if mode_val == 1:
+                        import_mode = "Calculate"
+                    elif mode_val == 2:
+                        import_mode = "None"
+                    else:
+                        import_mode = "Import"
+                elif line.startswith("normalSmoothAngle:"):
+                    try:
+                        smooth_angle = float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+
+    return import_mode, max(0.0, min(180.0, smooth_angle))
+
+
+def _resolve_unity_normal_import_mode(asset_path: str) -> str:
+    env_mode = (os.environ.get("BRIDGE_IMPORT_NORMAL_MODE") or "").strip()
+    if env_mode in ("Import", "Calculate", "None"):
+        return env_mode
+    meta_mode, _ = _read_unity_meta_normal_settings(asset_path)
+    return meta_mode
+
+
+def _unity_import_smooth_angle_deg(asset_path: str) -> float:
+    env_angle = os.environ.get("BRIDGE_IMPORT_SMOOTH_ANGLE", "").strip()
+    if env_angle:
+        try:
+            return max(0.0, min(180.0, float(env_angle)))
+        except ValueError:
+            pass
+    _, meta_angle = _read_unity_meta_normal_settings(asset_path)
+    return meta_angle
+
+
+def _better_fbx_import_kwargs(path: str) -> dict:
+    """
+    Better FBX import preset aligned with Unity ModelImporter.
+
+    Unity Import mode stores per-corner normals. Better FBX modes like 'Blender' or 'FBXSDK'
+    add hundreds of sharp edges in Blender 5.x, which breaks that shading (tested: 296 vs 0 sharp).
+    We therefore keep edge smoothing off and finalize after import.
+    """
+    unity_mode = _resolve_unity_normal_import_mode(path)
+    smooth_angle = _unity_import_smooth_angle_deg(path)
+
+    if unity_mode == "Calculate":
+        better_normal = "Calculate"
+    elif unity_mode == "None":
+        better_normal = "Calculate"
+    else:
+        better_normal = "Import"
+
+    edge_mode = (os.environ.get("BRIDGE_IMPORT_EDGE_SMOOTHING") or "None").strip()
+    if edge_mode not in _VALID_BETTER_IMPORT_EDGE_SMOOTHING:
+        edge_mode = "None"
+
+    return {
+        "filepath": path,
+        "my_import_normal": better_normal,
+        "use_auto_smooth": True,
+        "my_angle": smooth_angle,
+        "my_shade_mode": "Smooth",
+        "my_edge_smoothing": edge_mode,
+        "use_edge_crease": False,
+        "use_fix_attributes": True,
+    }
+
+
+def _finalize_imported_normals_for_unity(asset_path: str) -> None:
+    """
+    Unity Import: keep FBX custom corner normals — do NOT add Blender sharp edges.
+    Unity Calculate: use angle-based smooth shading when no custom normals exist.
+    """
+    angle_deg = _unity_import_smooth_angle_deg(asset_path)
+    unity_mode = _resolve_unity_normal_import_mode(asset_path)
+    mesh_count = 0
+    custom_count = 0
+    cleared_sharp = 0
+
+    view_layer = bpy.context.view_layer
+    prev_active = view_layer.objects.active
+    prev_mode = bpy.context.mode
+    if prev_mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH" or obj.data is None or not obj.data.polygons:
+            continue
+
+        mesh = obj.data
+        mesh_count += 1
+
+        for poly in mesh.polygons:
+            poly.use_smooth = True
+
+        before_sharp = sum(1 for edge in mesh.edges if edge.use_edge_sharp)
+        for edge in mesh.edges:
+            edge.use_edge_sharp = False
+        cleared_sharp += before_sharp
+
+        has_custom = bool(getattr(mesh, "has_custom_normals", False))
+        if has_custom:
+            custom_count += 1
+            mesh.update()
+            continue
+
+        if unity_mode in ("Calculate", "None") and hasattr(bpy.ops.object, "shade_smooth_by_angle"):
+            view_layer.objects.active = obj
+            obj.select_set(True)
+            try:
+                bpy.ops.object.shade_smooth_by_angle(angle=math.radians(angle_deg))
+            except Exception as ex:
+                print(f"BLENDER_BRIDGE_WARN: shade_smooth_by_angle failed on {obj.name}: {ex}")
+            obj.select_set(False)
+
+        mesh.update()
+
+    if prev_active:
+        view_layer.objects.active = prev_active
+
+    print(
+        f"BLENDER_BRIDGE: normals finalize v{_BRIDGE_SCRIPT_VERSION} "
+        f"unity_mode={unity_mode} meshes={mesh_count} custom={custom_count} "
+        f"cleared_sharp={cleared_sharp} angle={angle_deg:.1f}"
+    )
+
+
 def _import_fbx_better_or_builtin(path: str) -> bool:
     """
     Prefer Better FBX (ASCII + binary); fall back to bpy.ops.import_scene.fbx for binary only.
@@ -148,8 +301,15 @@ def _import_fbx_better_or_builtin(path: str) -> bool:
             try:
                 if bpy.context.mode != "OBJECT":
                     bpy.ops.object.mode_set(mode="OBJECT")
-                ret = bpy.ops.better_import.fbx(filepath=path)
+                import_kwargs = _better_fbx_import_kwargs(path)
+                ret = bpy.ops.better_import.fbx(**import_kwargs)
                 if ret == {"FINISHED"}:
+                    unity_mode = _resolve_unity_normal_import_mode(path)
+                    print(
+                        f"BLENDER_BRIDGE: Better FBX import v{_BRIDGE_SCRIPT_VERSION} "
+                        f"unity={unity_mode} better_normal={import_kwargs['my_import_normal']} "
+                        f"angle={import_kwargs['my_angle']} edge={import_kwargs['my_edge_smoothing']}"
+                    )
                     _plog("import via Better FBX (better_import.fbx)")
                     return True
                 print(f"BLENDER_BRIDGE_WARN: better_import.fbx returned {ret!r}, trying builtin importer")
@@ -232,6 +392,7 @@ class UnityModelExporter:
         self.extension = os.path.splitext(model_path)[1].lower()
 
     def load_model(self):
+        print(f"BLENDER_BRIDGE: load_model v{_BRIDGE_SCRIPT_VERSION} -> {self.filename}")
         _plog(f"load_model begin {self.model_path}")
 
         if bpy.context.mode != "OBJECT":
@@ -244,6 +405,7 @@ class UnityModelExporter:
         if self.extension == ".fbx":
             if not _import_fbx_better_or_builtin(self.model_path):
                 return
+            _finalize_imported_normals_for_unity(self.model_path)
         elif self.extension == ".obj":
             bpy.ops.wm.obj_import(filepath=self.model_path)
         elif self.extension == ".dae":
@@ -445,12 +607,44 @@ def unregister():
     bpy.utils.unregister_class(WM_OT_save_unity_model)
 
 
+def _injector_script_path() -> str | None:
+    path = os.environ.get("BLENDER_BRIDGE_INJECTOR", "").strip()
+    if path and os.path.isfile(path):
+        return path
+    try:
+        here = os.path.abspath(__file__)
+        if os.path.isfile(here):
+            return here
+    except NameError:
+        pass
+    return None
+
+
+def _load_injector_module_from_disk():
+    path = _injector_script_path()
+    if not path:
+        return None
+    module_name = f"blender_bridge_injector_{time.time_ns()}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _run_unity_load(model_path: str):
-    UnityModelExporter(model_path).load_model()
+    mod = _load_injector_module_from_disk()
+    if mod is not None and hasattr(mod, "UnityModelExporter"):
+        mod.UnityModelExporter(model_path).load_model()
+    else:
+        UnityModelExporter(model_path).load_model()
     return None
 
 
 if __name__ == "__main__":
+    if __file__:
+        os.environ.setdefault("BLENDER_BRIDGE_INJECTOR", os.path.abspath(__file__))
     register()
     _ensure_bridge_server()
 
