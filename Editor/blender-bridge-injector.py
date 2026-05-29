@@ -1,6 +1,5 @@
 import bpy
 import importlib.util
-import math
 import os
 import queue
 import socket
@@ -26,7 +25,7 @@ _FORCE_BUILTIN_FBX = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX", "").lower() in (
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.2"
+_BRIDGE_SCRIPT_VERSION = "2.3"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -200,95 +199,36 @@ def _unity_import_smooth_angle_deg(asset_path: str) -> float:
 
 def _better_fbx_import_kwargs(path: str) -> dict:
     """
-    Better FBX import preset aligned with Unity ModelImporter.
+    Match the Better FBX manual import dialog defaults (Auto Smooth on, FBXSDK smoothing).
 
-    Unity Import mode stores per-corner normals. Better FBX modes like 'Blender' or 'FBXSDK'
-    add hundreds of sharp edges in Blender 5.x, which breaks that shading (tested: 296 vs 0 sharp).
-    We therefore keep edge smoothing off and finalize after import.
+    Only override what Unity .meta implies; leave edge smoothing / crease at Better FBX defaults.
+    v2.2 forced edge=None and cleared sharp edges afterward, which broke shading vs manual import.
     """
-    unity_mode = _resolve_unity_normal_import_mode(path)
     smooth_angle = _unity_import_smooth_angle_deg(path)
+    unity_mode = _resolve_unity_normal_import_mode(path)
 
-    if unity_mode == "Calculate":
-        better_normal = "Calculate"
-    elif unity_mode == "None":
-        better_normal = "Calculate"
-    else:
-        better_normal = "Import"
-
-    edge_mode = (os.environ.get("BRIDGE_IMPORT_EDGE_SMOOTHING") or "None").strip()
-    if edge_mode not in _VALID_BETTER_IMPORT_EDGE_SMOOTHING:
-        edge_mode = "None"
-
-    return {
+    kwargs = {
         "filepath": path,
-        "my_import_normal": better_normal,
         "use_auto_smooth": True,
         "my_angle": smooth_angle,
         "my_shade_mode": "Smooth",
-        "my_edge_smoothing": edge_mode,
-        "use_edge_crease": False,
+        "my_edge_smoothing": "FBXSDK",
+        "use_edge_crease": True,
         "use_fix_attributes": True,
     }
 
+    if unity_mode == "Calculate":
+        kwargs["my_import_normal"] = "Calculate"
+    elif unity_mode == "None":
+        kwargs["my_import_normal"] = "Calculate"
+    else:
+        kwargs["my_import_normal"] = "Import"
 
-def _finalize_imported_normals_for_unity(asset_path: str) -> None:
-    """
-    Unity Import: keep FBX custom corner normals — do NOT add Blender sharp edges.
-    Unity Calculate: use angle-based smooth shading when no custom normals exist.
-    """
-    angle_deg = _unity_import_smooth_angle_deg(asset_path)
-    unity_mode = _resolve_unity_normal_import_mode(asset_path)
-    mesh_count = 0
-    custom_count = 0
-    cleared_sharp = 0
+    edge_mode = (os.environ.get("BRIDGE_IMPORT_EDGE_SMOOTHING") or "").strip()
+    if edge_mode in _VALID_BETTER_IMPORT_EDGE_SMOOTHING:
+        kwargs["my_edge_smoothing"] = edge_mode
 
-    view_layer = bpy.context.view_layer
-    prev_active = view_layer.objects.active
-    prev_mode = bpy.context.mode
-    if prev_mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-    for obj in bpy.context.scene.objects:
-        if obj.type != "MESH" or obj.data is None or not obj.data.polygons:
-            continue
-
-        mesh = obj.data
-        mesh_count += 1
-
-        for poly in mesh.polygons:
-            poly.use_smooth = True
-
-        before_sharp = sum(1 for edge in mesh.edges if edge.use_edge_sharp)
-        for edge in mesh.edges:
-            edge.use_edge_sharp = False
-        cleared_sharp += before_sharp
-
-        has_custom = bool(getattr(mesh, "has_custom_normals", False))
-        if has_custom:
-            custom_count += 1
-            mesh.update()
-            continue
-
-        if unity_mode in ("Calculate", "None") and hasattr(bpy.ops.object, "shade_smooth_by_angle"):
-            view_layer.objects.active = obj
-            obj.select_set(True)
-            try:
-                bpy.ops.object.shade_smooth_by_angle(angle=math.radians(angle_deg))
-            except Exception as ex:
-                print(f"BLENDER_BRIDGE_WARN: shade_smooth_by_angle failed on {obj.name}: {ex}")
-            obj.select_set(False)
-
-        mesh.update()
-
-    if prev_active:
-        view_layer.objects.active = prev_active
-
-    print(
-        f"BLENDER_BRIDGE: normals finalize v{_BRIDGE_SCRIPT_VERSION} "
-        f"unity_mode={unity_mode} meshes={mesh_count} custom={custom_count} "
-        f"cleared_sharp={cleared_sharp} angle={angle_deg:.1f}"
-    )
+    return kwargs
 
 
 def _import_fbx_better_or_builtin(path: str) -> bool:
@@ -405,7 +345,6 @@ class UnityModelExporter:
         if self.extension == ".fbx":
             if not _import_fbx_better_or_builtin(self.model_path):
                 return
-            _finalize_imported_normals_for_unity(self.model_path)
         elif self.extension == ".obj":
             bpy.ops.wm.obj_import(filepath=self.model_path)
         elif self.extension == ".dae":
