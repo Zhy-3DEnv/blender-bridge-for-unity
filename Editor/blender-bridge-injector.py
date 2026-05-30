@@ -94,24 +94,28 @@ def _bridge_accept_loop(port: int):
             break
         try:
             conn.settimeout(60.0)
-            data = b""
-            while b"\n" not in data:
+            buffer = b""
+            while True:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
-                data += chunk
-            line = data.decode("utf-8", errors="replace").split("\n", 1)[0].strip()
-            if line == "PING":
-                conn.sendall(b"PONG\n")
-            elif line.startswith("IMPORT|"):
-                raw = line[7:].strip()
-                if raw and os.path.isfile(raw):
-                    _bridge_cmd_queue.put(raw)
-                    conn.sendall(b"OK\n")
-                else:
-                    conn.sendall(b"ERR|bad path\n")
-            else:
-                conn.sendall(b"ERR|unknown\n")
+                buffer += chunk
+                while b"\n" in buffer:
+                    line_raw, buffer = buffer.split(b"\n", 1)
+                    line = line_raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line == "PING":
+                        conn.sendall(b"PONG\n")
+                    elif line.startswith("IMPORT|"):
+                        raw = line[7:].strip()
+                        if raw and os.path.isfile(raw):
+                            _bridge_cmd_queue.put(raw)
+                            conn.sendall(b"OK\n")
+                        else:
+                            conn.sendall(b"ERR|bad path\n")
+                    else:
+                        conn.sendall(b"ERR|unknown\n")
         except Exception as ex:
             try:
                 conn.sendall(f"ERR|{ex}\n".encode("utf-8"))
