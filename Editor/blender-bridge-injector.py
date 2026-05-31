@@ -28,7 +28,7 @@ _FORCE_BUILTIN_FBX = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX", "").lower() in (
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.4"
+_BRIDGE_SCRIPT_VERSION = "2.5"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -218,15 +218,33 @@ def _read_unity_meta_export_settings(asset_path: str) -> dict:
 
 
 def _resolve_better_fbx_axis(asset_path: str | None) -> str:
-    """Pick Better FBX axis preset from env, Unity .meta, or safe Unity default."""
+    """
+    Better FBX 'Unity' axis rotates 180 deg around Y (character-facing preset) and, with
+    optimize_for_game_engine + only_root_empty_node, injects +/-90 deg child rotations.
+    Static scene FBX round-trip needs MayaZUp (verified on CombatIsland M_r_* assets).
+    """
     env_axis = (os.environ.get("BRIDGE_EXPORT_FBX_AXIS") or "").strip()
     if env_axis in _VALID_BETTER_EXPORT_AXES:
         return env_axis
-    if asset_path:
-        meta = _read_unity_meta_export_settings(asset_path)
-        if meta["bake_axis_conversion"]:
-            return "MayaZUp"
-    return "Unity"
+    return "MayaZUp"
+
+
+def _export_optimize_for_game_engine() -> bool:
+    env = os.environ.get("BRIDGE_EXPORT_OPTIMIZE_GAME_ENGINE", "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    return False
+
+
+def _export_only_root_empty_node() -> bool:
+    env = os.environ.get("BRIDGE_EXPORT_ONLY_ROOT_EMPTY", "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    return False
 
 
 def _export_move_to_origin(asset_path: str | None) -> bool:
@@ -243,16 +261,23 @@ def _matrix_to_rows(m: Matrix) -> list[list[float]]:
 
 
 def _capture_transform_baseline() -> None:
-    """Snapshot object transforms after import so mesh-only edits round-trip without drift."""
+    """Snapshot local transforms after import (flat or hierarchical) for round-trip."""
     items = []
     for obj in bpy.context.scene.objects:
-        items.append({"name": obj.name, "matrix_world": _matrix_to_rows(obj.matrix_world)})
+        items.append(
+            {
+                "name": obj.name,
+                "parent": obj.parent.name if obj.parent else None,
+                "matrix_local": _matrix_to_rows(obj.matrix_local),
+                "matrix_world": _matrix_to_rows(obj.matrix_world),
+            }
+        )
     bpy.context.scene["unity_bridge_transform_baseline"] = json.dumps(items)
     _plog(f"transform baseline captured ({len(items)} objects)")
 
 
 def _restore_transform_baseline() -> None:
-    """Restore transforms from import baseline (typical mesh edit keeps object pivots stable in Unity)."""
+    """Restore import baseline before export (mesh-only edits should not drift child local rot)."""
     raw = bpy.context.scene.get("unity_bridge_transform_baseline")
     if not raw:
         return
@@ -261,14 +286,27 @@ def _restore_transform_baseline() -> None:
     except (TypeError, json.JSONDecodeError):
         return
     by_name = {obj.name: obj for obj in bpy.context.scene.objects}
+
+    # Re-link parents first (in case hierarchy changed).
+    for item in items:
+        obj = by_name.get(item.get("name", ""))
+        if obj is None:
+            continue
+        parent_name = item.get("parent")
+        obj.parent = by_name.get(parent_name) if parent_name else None
+
     restored = 0
     for item in items:
         obj = by_name.get(item.get("name", ""))
-        matrix = item.get("matrix_world")
-        if obj is None or not matrix:
+        if obj is None:
             continue
-        obj.matrix_world = Matrix(matrix)
-        restored += 1
+        matrix_local = item.get("matrix_local")
+        if matrix_local:
+            obj.matrix_local = Matrix(matrix_local)
+            restored += 1
+        elif item.get("matrix_world"):
+            obj.matrix_world = Matrix(item["matrix_world"])
+            restored += 1
     if restored:
         print(f"BLENDER_BRIDGE: restored transform baseline for {restored} object(s)")
 
@@ -383,6 +421,8 @@ def _export_fbx_via_better_unity(filepath: str) -> bool:
     meta = _read_unity_meta_export_settings(filepath)
     axis = _resolve_better_fbx_axis(filepath)
     move_to_origin = _export_move_to_origin(filepath)
+    optimize_ge = _export_optimize_for_game_engine()
+    only_root_empty = _export_only_root_empty_node()
     global_scale = max(0.0001, float(meta.get("global_scale") or 1.0))
 
     try:
@@ -397,10 +437,10 @@ def _export_fbx_via_better_unity(filepath: str) -> bool:
             use_selection=False,
             use_active_collection=False,
             use_visible=False,
-            use_optimize_for_game_engine=True,
+            use_optimize_for_game_engine=optimize_ge,
             use_reset_mesh_origin=False,
             use_reset_mesh_rotation=False,
-            use_only_root_empty_node=True,
+            use_only_root_empty_node=only_root_empty,
             use_ignore_armature_node=True,
             use_apply_modifiers=True,
             use_include_armature_deform_modifier=False,
@@ -418,8 +458,8 @@ def _export_fbx_via_better_unity(filepath: str) -> bool:
         if ret == {"FINISHED"}:
             print(
                 f"BLENDER_BRIDGE: exported FBX v{_BRIDGE_SCRIPT_VERSION} "
-                f"axis={axis} move_to_origin={move_to_origin} "
-                f"bakeAxisConversion={meta['bake_axis_conversion']} globalScale={global_scale}"
+                f"axis={axis} optimize_ge={optimize_ge} only_root_empty={only_root_empty} "
+                f"move_to_origin={move_to_origin} globalScale={global_scale}"
             )
             return True
         print(f"BLENDER_BRIDGE_WARN: better_export.fbx returned {ret!r}, falling back to builtin")
