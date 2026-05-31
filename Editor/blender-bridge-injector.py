@@ -1,11 +1,14 @@
 import bpy
 import importlib.util
+import json
 import os
 import queue
 import socket
 import sys
 import threading
 import time
+
+from mathutils import Matrix
 
 bpy.context.preferences.view.show_splash = False
 
@@ -25,7 +28,7 @@ _FORCE_BUILTIN_FBX = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX", "").lower() in (
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.3"
+_BRIDGE_SCRIPT_VERSION = "2.4"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -182,6 +185,94 @@ def _read_unity_meta_normal_settings(asset_path: str) -> tuple[str, float]:
     return import_mode, max(0.0, min(180.0, smooth_angle))
 
 
+def _read_unity_meta_export_settings(asset_path: str) -> dict:
+    """
+    Read Unity ModelImporter settings that affect FBX round-trip (axis / scale).
+    bakeAxisConversion: 0 = keep file axis (typical game FBX), 1 = Unity bakes on import.
+    """
+    settings = {"bake_axis_conversion": False, "global_scale": 1.0}
+    meta_path = asset_path + ".meta"
+    if not os.path.isfile(meta_path):
+        return settings
+
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("bakeAxisConversion:"):
+                    try:
+                        settings["bake_axis_conversion"] = bool(
+                            int(line.split(":", 1)[1].strip())
+                        )
+                    except ValueError:
+                        pass
+                elif line.startswith("globalScale:"):
+                    try:
+                        settings["global_scale"] = float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+
+    return settings
+
+
+def _resolve_better_fbx_axis(asset_path: str | None) -> str:
+    """Pick Better FBX axis preset from env, Unity .meta, or safe Unity default."""
+    env_axis = (os.environ.get("BRIDGE_EXPORT_FBX_AXIS") or "").strip()
+    if env_axis in _VALID_BETTER_EXPORT_AXES:
+        return env_axis
+    if asset_path:
+        meta = _read_unity_meta_export_settings(asset_path)
+        if meta["bake_axis_conversion"]:
+            return "MayaZUp"
+    return "Unity"
+
+
+def _export_move_to_origin(asset_path: str | None) -> bool:
+    env = os.environ.get("BRIDGE_EXPORT_MOVE_TO_ORIGIN", "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    return False
+
+
+def _matrix_to_rows(m: Matrix) -> list[list[float]]:
+    return [list(row) for row in m]
+
+
+def _capture_transform_baseline() -> None:
+    """Snapshot object transforms after import so mesh-only edits round-trip without drift."""
+    items = []
+    for obj in bpy.context.scene.objects:
+        items.append({"name": obj.name, "matrix_world": _matrix_to_rows(obj.matrix_world)})
+    bpy.context.scene["unity_bridge_transform_baseline"] = json.dumps(items)
+    _plog(f"transform baseline captured ({len(items)} objects)")
+
+
+def _restore_transform_baseline() -> None:
+    """Restore transforms from import baseline (typical mesh edit keeps object pivots stable in Unity)."""
+    raw = bpy.context.scene.get("unity_bridge_transform_baseline")
+    if not raw:
+        return
+    try:
+        items = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return
+    by_name = {obj.name: obj for obj in bpy.context.scene.objects}
+    restored = 0
+    for item in items:
+        obj = by_name.get(item.get("name", ""))
+        matrix = item.get("matrix_world")
+        if obj is None or not matrix:
+            continue
+        obj.matrix_world = Matrix(matrix)
+        restored += 1
+    if restored:
+        print(f"BLENDER_BRIDGE: restored transform baseline for {restored} object(s)")
+
+
 def _resolve_unity_normal_import_mode(asset_path: str) -> str:
     env_mode = (os.environ.get("BRIDGE_IMPORT_NORMAL_MODE") or "").strip()
     if env_mode in ("Import", "Calculate", "None"):
@@ -280,16 +371,20 @@ def _better_export_fbx_available() -> bool:
 
 def _export_fbx_via_better_unity(filepath: str) -> bool:
     """
-    Better FBX exporter preset aligned with Unity workflow (see user Game Engine / Mesh / Edge / Batch options).
-    Axis preset: BRIDGE_EXPORT_FBX_AXIS (default MayaZUp); use 'Unity' if you need Better's Unity-facing rotation.
+    Better FBX exporter preset aligned with Unity workflow.
+    Axis: Unity .meta bakeAxisConversion=0 -> Unity axis (default for game FBX).
+    Preserves object transforms: use_move_to_origin=False, baseline restore before export.
     """
     if _FORCE_BUILTIN_FBX_EXPORT:
         return False
     if not _enable_better_fbx_addon() or not _better_export_fbx_available():
         return False
-    axis = (os.environ.get("BRIDGE_EXPORT_FBX_AXIS") or "MayaZUp").strip()
-    if axis not in _VALID_BETTER_EXPORT_AXES:
-        axis = "MayaZUp"
+
+    meta = _read_unity_meta_export_settings(filepath)
+    axis = _resolve_better_fbx_axis(filepath)
+    move_to_origin = _export_move_to_origin(filepath)
+    global_scale = max(0.0001, float(meta.get("global_scale") or 1.0))
+
     try:
         if bpy.context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
@@ -315,13 +410,17 @@ def _export_fbx_via_better_unity(filepath: str) -> bool:
             use_edge_crease=True,
             my_edge_crease_scale=1.0,
             my_separate_files=False,
-            use_move_to_origin=True,
+            use_move_to_origin=move_to_origin,
             use_animation=True,
             use_embed_media=False,
             use_copy_texture=False,
         )
         if ret == {"FINISHED"}:
-            print("BLENDER_BRIDGE: exported FBX via Better FBX (Unity-oriented preset)")
+            print(
+                f"BLENDER_BRIDGE: exported FBX v{_BRIDGE_SCRIPT_VERSION} "
+                f"axis={axis} move_to_origin={move_to_origin} "
+                f"bakeAxisConversion={meta['bake_axis_conversion']} globalScale={global_scale}"
+            )
             return True
         print(f"BLENDER_BRIDGE_WARN: better_export.fbx returned {ret!r}, falling back to builtin")
     except Exception as ex:
@@ -399,6 +498,7 @@ class UnityModelExporter:
                 print(f"[BRIDGE_PROFILE] undo_history_clear skipped: {ex}")
 
         _plog("load_model end")
+        _capture_transform_baseline()
         print(f"Loaded '{self.filename}'")
 
     def apply_textures(self):
@@ -452,12 +552,18 @@ class UnityModelExporter:
     @staticmethod
     def export_to_unity(filepath, file_format):
         """Export scene back to Unity in the original format"""
+        if bpy.context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        _restore_transform_baseline()
+
         if file_format == ".fbx":
             if _export_fbx_via_better_unity(filepath):
                 return
+            meta = _read_unity_meta_export_settings(filepath)
+            global_scale = max(0.0001, float(meta.get("global_scale") or 1.0))
             bpy.ops.export_scene.fbx(
                 filepath=filepath,
-                global_scale=1.0,
+                global_scale=global_scale,
                 apply_unit_scale=True,
                 apply_scale_options="FBX_SCALE_UNITS",
                 object_types={"ARMATURE", "MESH", "EMPTY"},
@@ -466,8 +572,13 @@ class UnityModelExporter:
                 secondary_bone_axis="X",
                 armature_nodetype="NULL",
                 bake_anim=True,
+                bake_space_transform=False,
                 axis_forward="-Z",
                 axis_up="Y",
+            )
+            print(
+                f"BLENDER_BRIDGE: exported FBX via builtin "
+                f"bakeAxisConversion={meta['bake_axis_conversion']} globalScale={global_scale}"
             )
         elif file_format == ".obj":
             bpy.ops.wm.obj_export(
