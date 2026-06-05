@@ -3,6 +3,7 @@
 using System;
 using System.IO;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using UnityEditor;
@@ -80,6 +81,7 @@ public static class BlenderBridgeProcessor
 
         if (TrySendImportToRunningBlenderWithRetries(modelFullPath))
         {
+            TryBringBlenderToForeground();
             if (DEBUG)
             {
                 Debug.Log($"Blender bridge: imported into existing Blender — '{assetPath}'");
@@ -214,6 +216,130 @@ public static class BlenderBridgeProcessor
             return Encoding.UTF8.GetString(ms.ToArray());
         }
     }
+
+    /// <summary>
+    /// After a hot-reuse import, raise the Blender window (Windows only).
+    /// Called from Unity right after the user double-clicked an asset.
+    /// </summary>
+    private static void TryBringBlenderToForeground()
+    {
+#if UNITY_EDITOR_WIN
+        try
+        {
+            System.Diagnostics.Process[] processes = System.Diagnostics.Process.GetProcessesByName("blender");
+            IntPtr targetHwnd = IntPtr.Zero;
+            int targetPid = -1;
+
+            foreach (System.Diagnostics.Process process in processes)
+            {
+                try
+                {
+                    IntPtr hwnd = process.MainWindowHandle;
+                    if (hwnd == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    targetHwnd = hwnd;
+                    targetPid = process.Id;
+                    break;
+                }
+                catch
+                {
+                    // Process may exit while enumerating.
+                }
+            }
+
+            if (targetHwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (IsIconic(targetHwnd))
+            {
+                ShowWindow(targetHwnd, SwRestore);
+            }
+            else
+            {
+                ShowWindow(targetHwnd, SwShow);
+            }
+
+            if (targetPid > 0)
+            {
+                AllowSetForegroundWindow(targetPid);
+            }
+
+            IntPtr foregroundHwnd = GetForegroundWindow();
+            uint foregroundThreadId = GetWindowThreadProcessId(foregroundHwnd, out _);
+            uint targetThreadId = GetWindowThreadProcessId(targetHwnd, out _);
+            uint currentThreadId = GetCurrentThreadId();
+
+            bool attachedToForeground = false;
+            bool attachedToTarget = false;
+            if (foregroundThreadId != currentThreadId)
+            {
+                attachedToForeground = AttachThreadInput(currentThreadId, foregroundThreadId, true);
+            }
+
+            if (targetThreadId != currentThreadId)
+            {
+                attachedToTarget = AttachThreadInput(currentThreadId, targetThreadId, true);
+            }
+
+            SetForegroundWindow(targetHwnd);
+            BringWindowToTop(targetHwnd);
+
+            if (attachedToTarget)
+            {
+                AttachThreadInput(currentThreadId, targetThreadId, false);
+            }
+
+            if (attachedToForeground)
+            {
+                AttachThreadInput(currentThreadId, foregroundThreadId, false);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (DEBUG)
+            {
+                Debug.Log($"Blender bridge: could not focus Blender ({ex.GetType().Name})");
+            }
+        }
+#endif
+    }
+
+#if UNITY_EDITOR_WIN
+    private const int SwShow = 5;
+    private const int SwRestore = 9;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+#endif
 
     private static void StartBlenderWithArguments(string arguments, string injectorScriptPath)
     {

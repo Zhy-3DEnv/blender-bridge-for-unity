@@ -66,6 +66,50 @@ def _enable_better_fbx_addon() -> bool:
     return hasattr(bpy.ops, "better_import") and hasattr(bpy.ops.better_import, "fbx")
 
 
+def _bring_window_to_front() -> None:
+    """Raise this Blender instance when Unity hot-imports into an existing window."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        pid = os.getpid()
+        found_hwnd = None
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _enum_cb(hwnd, _lparam):
+            nonlocal found_hwnd
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            proc_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value != pid:
+                return True
+            if user32.GetParent(hwnd) == 0:
+                found_hwnd = hwnd
+                return False
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        if not found_hwnd:
+            return
+
+        if user32.IsIconic(found_hwnd):
+            user32.ShowWindow(found_hwnd, 9)
+        else:
+            user32.ShowWindow(found_hwnd, 5)
+
+        user32.AllowSetForegroundWindow(pid)
+        user32.SetForegroundWindow(found_hwnd)
+        user32.BringWindowToTop(found_hwnd)
+    except Exception as ex:
+        if _PROFILE:
+            print(f"[BRIDGE_PROFILE] bring_window_to_front: {ex}")
+
+
 def _bridge_process_queue():
     """Runs on the main thread; one import per tick."""
     try:
@@ -73,6 +117,7 @@ def _bridge_process_queue():
     except queue.Empty:
         return 0.05
     try:
+        _bring_window_to_front()
         _run_unity_load(path)
     except Exception as ex:
         print(f"BLENDER_BRIDGE_ERROR: queued import failed for {path!r}: {ex}")
