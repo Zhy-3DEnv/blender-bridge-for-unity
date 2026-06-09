@@ -43,15 +43,63 @@ public static class BlenderBridgeProcessor
         {
             if (_cachedPythonScriptPath == null)
             {
-                string[] guids = AssetDatabase.FindAssets("blender-bridge-injector t:DefaultAsset");
-                if (guids.Length > 0)
-                {
-                    string assetPath = AssetDatabase.GUIDToAssetPath(guids[0]);
-                    _cachedPythonScriptPath = Path.GetFullPath(assetPath);
-                }
+                _cachedPythonScriptPath = ResolveInjectorScriptPath();
             }
             return _cachedPythonScriptPath;
         }
+    }
+
+    /// <summary>Resolve injector next to BlenderBridgeProcessor.cs (Assets, embedded Packages, PackageCache).</summary>
+    private static string ResolveInjectorScriptPath()
+    {
+        string[] guids = AssetDatabase.FindAssets("BlenderBridgeProcessor t:MonoScript");
+        if (guids.Length == 0)
+        {
+            return null;
+        }
+
+        string processorAssetPath = AssetDatabase.GUIDToAssetPath(guids[0]);
+        string processorDir = Path.GetDirectoryName(processorAssetPath);
+        if (string.IsNullOrEmpty(processorDir))
+        {
+            return null;
+        }
+
+        string injectorAssetPath = Path.Combine(processorDir, "blender-bridge-injector.py")
+            .Replace('\\', '/');
+
+        string projectRoot = Path.GetDirectoryName(Application.dataPath);
+        string projectRelativePath = Path.GetFullPath(Path.Combine(projectRoot, injectorAssetPath));
+        if (File.Exists(projectRelativePath))
+        {
+            return projectRelativePath;
+        }
+
+        UnityEditor.PackageManager.PackageInfo packageInfo =
+            UnityEditor.PackageManager.PackageInfo.FindForAssetPath(processorAssetPath);
+        if (packageInfo != null && !string.IsNullOrEmpty(packageInfo.resolvedPath))
+        {
+            string packageCachePath = Path.GetFullPath(
+                Path.Combine(packageInfo.resolvedPath, "Editor", "blender-bridge-injector.py"));
+            if (File.Exists(packageCachePath))
+            {
+                return packageCachePath;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Turn a Unity asset path (Assets/...) into an absolute filesystem path.</summary>
+    private static string ResolveAssetFullPath(string assetPath)
+    {
+        if (Path.IsPathRooted(assetPath))
+        {
+            return Path.GetFullPath(assetPath);
+        }
+
+        string projectRoot = Path.GetDirectoryName(Application.dataPath);
+        return Path.GetFullPath(Path.Combine(projectRoot, assetPath));
     }
 
     [OnOpenAsset]
@@ -61,25 +109,37 @@ public static class BlenderBridgeProcessor
         string assetPath = AssetDatabase.GetAssetPath(instanceId);
         string extension = Path.GetExtension(assetPath).ToLowerInvariant();
 
-        if (Array.Exists(SUPPORTED_EXTENSIONS, ext => ext.Equals(extension, StringComparison.OrdinalIgnoreCase))
-            && obj is GameObject)
+        if (!Array.Exists(SUPPORTED_EXTENSIONS, ext => ext.Equals(extension, StringComparison.OrdinalIgnoreCase)))
         {
-            if (DEBUG)
-            {
-                Debug.Log($"Opening {extension.ToUpper()} '{assetPath}' in Blender");
-            }
-
-            OpenInBlender(assetPath);
-            return true;
+            return false;
         }
-        return false;
+
+        if (string.IsNullOrEmpty(assetPath))
+        {
+            return false;
+        }
+
+        string modelFullPath = ResolveAssetFullPath(assetPath);
+        if (!File.Exists(modelFullPath))
+        {
+            Debug.LogError($"[BlenderBridge] Model file not found: '{modelFullPath}' (asset: '{assetPath}')");
+            return false;
+        }
+
+        if (DEBUG)
+        {
+            string objType = obj != null ? obj.GetType().Name : "null";
+            Debug.Log($"Opening {extension.ToUpper()} '{assetPath}' in Blender (object: {objType})");
+        }
+
+        OpenInBlender(assetPath, modelFullPath);
+        return true;
     }
 
-    private static void OpenInBlender(string assetPath)
+    private static void OpenInBlender(string assetPath, string modelFullPath)
     {
-        string modelFullPath = Path.GetFullPath(assetPath);
-
-        if (TrySendImportToRunningBlenderWithRetries(modelFullPath))
+        string importResult = TrySendImportToRunningBlenderWithRetries(modelFullPath);
+        if (importResult == "OK")
         {
             TryBringBlenderToForeground();
             if (DEBUG)
@@ -89,11 +149,15 @@ public static class BlenderBridgeProcessor
             return;
         }
 
-        if (DEBUG)
+        if (!string.IsNullOrEmpty(importResult) && importResult != "TIMEOUT")
+        {
+            Debug.LogWarning($"[BlenderBridge] Hot reuse failed ({importResult}). Launching Blender. Path: '{modelFullPath}'");
+        }
+        else if (DEBUG)
         {
             string py = PYTHON_SCRIPT_PATH ?? "(injector not found)";
             Debug.LogWarning(
-                $"[BlenderBridge] 未连上 127.0.0.1:{BridgeListenPort} 的复用监听，将启动新 Blender。injector: {py}");
+                $"[BlenderBridge] No listener on 127.0.0.1:{BridgeListenPort}; launching Blender. Injector: {py}");
         }
 
         if (!File.Exists(BLENDER_PATH))
@@ -105,11 +169,17 @@ public static class BlenderBridgeProcessor
         string pythonScript = PYTHON_SCRIPT_PATH;
         if (pythonScript == null)
         {
-            Debug.LogError("Python script not found");
+            Debug.LogError(
+                "[BlenderBridge] Python injector not found. Reimport the package or check that " +
+                "Editor/blender-bridge-injector.py exists next to BlenderBridgeProcessor.cs.");
             return;
         }
 
         string arguments = $"--python \"{pythonScript}\" -- \"{modelFullPath}\"";
+        if (DEBUG)
+        {
+            Debug.Log($"[BlenderBridge] Launching Blender with model: '{modelFullPath}'");
+        }
         StartBlenderWithArguments(arguments, pythonScript);
     }
 
@@ -117,18 +187,26 @@ public static class BlenderBridgeProcessor
     /// If a Blender window started by this bridge is still running, it listens on 127.0.0.1:BridgeListenPort.
     /// Retries so a second double-click while the first Blender is still starting does not open a second window.
     /// </summary>
-    private static bool TrySendImportToRunningBlenderWithRetries(string modelFullPath)
+    /// <returns>"OK", null/empty when no listener, or an error token such as "ERR|bad path".</returns>
+    private static string TrySendImportToRunningBlenderWithRetries(string modelFullPath)
     {
         float now = Time.realtimeSinceStartup;
         bool aggressive = _lastBlenderSpawnRealtime >= 0f
             && (now - _lastBlenderSpawnRealtime) < BlenderSpawnReuseWindowSec;
         int maxRounds = aggressive ? BlenderReuseRoundsAfterSpawn : BlenderReuseRoundsCold;
+        string lastError = null;
 
         for (int round = 0; round < maxRounds; round++)
         {
-            if (TrySendImportToRunningBlenderOnce(modelFullPath))
+            string result = TrySendImportToRunningBlenderOnce(modelFullPath);
+            if (result == "OK")
             {
-                return true;
+                return "OK";
+            }
+
+            if (!string.IsNullOrEmpty(result))
+            {
+                lastError = result;
             }
 
             if (round < maxRounds - 1)
@@ -137,10 +215,10 @@ public static class BlenderBridgeProcessor
             }
         }
 
-        return false;
+        return lastError ?? "TIMEOUT";
     }
 
-    private static bool TrySendImportToRunningBlenderOnce(string modelFullPath)
+    private static string TrySendImportToRunningBlenderOnce(string modelFullPath)
     {
         try
         {
@@ -149,7 +227,7 @@ public static class BlenderBridgeProcessor
                 IAsyncResult ar = client.BeginConnect("127.0.0.1", BridgeListenPort, null, null);
                 if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(BridgeConnectTimeoutMs)))
                 {
-                    return false;
+                    return null;
                 }
 
                 client.EndConnect(ar);
@@ -162,12 +240,12 @@ public static class BlenderBridgeProcessor
                     string pong = ReadUtf8Line(stream).Trim();
                     if (pong != "PONG")
                     {
-                        return false;
+                        return $"unexpected pong: {pong}";
                     }
 
                     WriteUtf8Line(stream, "IMPORT|" + modelFullPath);
-                    string ok = ReadUtf8Line(stream).Trim();
-                    return ok == "OK";
+                    string ack = ReadUtf8Line(stream).Trim();
+                    return ack == "OK" ? "OK" : ack;
                 }
             }
         }
@@ -177,7 +255,7 @@ public static class BlenderBridgeProcessor
             {
                 Debug.Log($"Blender bridge: listener not ready ({ex.GetType().Name})");
             }
-            return false;
+            return null;
         }
     }
 
