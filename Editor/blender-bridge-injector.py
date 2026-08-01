@@ -34,7 +34,8 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.7"
+_BRIDGE_SCRIPT_VERSION = "2.8"
+_BRIDGE_MESH_SUFFIX = ".bridge-mesh"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -619,14 +620,201 @@ def _export_fbx_via_better_unity(filepath: str) -> bool:
     return False
 
 
+def _is_bridge_mesh_path(path: str) -> bool:
+    return path.lower().endswith(_BRIDGE_MESH_SUFFIX)
+
+
+def _resolve_model_format(path: str) -> str:
+    if _is_bridge_mesh_path(path):
+        return _BRIDGE_MESH_SUFFIX
+    return os.path.splitext(path)[1].lower()
+
+
+def _import_unity_bridge_mesh(path: str) -> bool:
+    """Load Unity Mesh interchange JSON written by BlenderBridgeUnityMesh.cs."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as ex:
+        print(f"BLENDER_BRIDGE_ERROR: failed to read bridge-mesh JSON: {ex}")
+        return False
+
+    verts_flat = data.get("vertices") or []
+    if not verts_flat or len(verts_flat) % 3 != 0:
+        print("BLENDER_BRIDGE_ERROR: bridge-mesh has no valid vertices")
+        return False
+
+    vertex_count = len(verts_flat) // 3
+    vertices = [
+        (verts_flat[i * 3], verts_flat[i * 3 + 1], verts_flat[i * 3 + 2])
+        for i in range(vertex_count)
+    ]
+
+    tris = data.get("triangles") or []
+    if len(tris) % 3 != 0:
+        print("BLENDER_BRIDGE_ERROR: bridge-mesh triangles length is not a multiple of 3")
+        return False
+    for idx in tris:
+        if idx < 0 or idx >= vertex_count:
+            print(f"BLENDER_BRIDGE_ERROR: bridge-mesh triangle index out of range: {idx}")
+            return False
+
+    faces = [(tris[i], tris[i + 1], tris[i + 2]) for i in range(0, len(tris), 3)]
+    name = (data.get("name") or os.path.splitext(os.path.basename(path))[0] or "UnityMesh").strip()
+    # Avoid Blender treating "foo.bridge" as the object name stem of foo.bridge-mesh
+    if name.lower().endswith(".bridge"):
+        name = name[: -len(".bridge")]
+
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+
+    normals_flat = data.get("normals") or []
+    if len(normals_flat) == vertex_count * 3 and mesh.loops:
+        try:
+            loop_normals = []
+            for loop in mesh.loops:
+                vi = loop.vertex_index
+                loop_normals.append(
+                    (
+                        normals_flat[vi * 3],
+                        normals_flat[vi * 3 + 1],
+                        normals_flat[vi * 3 + 2],
+                    )
+                )
+            mesh.normals_split_custom_set(loop_normals)
+        except Exception as ex:
+            print(f"BLENDER_BRIDGE_WARN: custom normals failed, using Blender defaults: {ex}")
+
+    uvs_flat = data.get("uvs") or []
+    if len(uvs_flat) == vertex_count * 2 and mesh.polygons:
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        for poly in mesh.polygons:
+            for loop_idx in poly.loop_indices:
+                vi = mesh.loops[loop_idx].vertex_index
+                uv_layer.data[loop_idx].uv = (uvs_flat[vi * 2], uvs_flat[vi * 2 + 1])
+
+    for poly in mesh.polygons:
+        poly.use_smooth = True
+
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+    unity_asset = data.get("unity_asset_path") or ""
+    print(
+        f"BLENDER_BRIDGE: bridge-mesh import v{_BRIDGE_SCRIPT_VERSION} "
+        f"name={name!r} verts={vertex_count} tris={len(faces)} unity={unity_asset!r}"
+    )
+    return True
+
+
+def _export_unity_bridge_mesh(filepath: str) -> None:
+    """Write edited scene meshes back to Unity Mesh interchange JSON."""
+    mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == "MESH" and obj.data]
+    if not mesh_objects:
+        raise RuntimeError("No mesh objects to export for Unity .mesh write-back")
+
+    # Prefer the active mesh; otherwise export the first mesh object.
+    active = bpy.context.view_layer.objects.active
+    if active is not None and active.type == "MESH" and active in mesh_objects:
+        target = active
+    else:
+        target = mesh_objects[0]
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = target.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    try:
+        mesh.calc_loop_triangles()
+
+        # Preserve Unity coordinates: use object-local mesh data (no axis conversion).
+        vertices = []
+        for v in mesh.vertices:
+            co = v.co
+            vertices.extend((float(co.x), float(co.y), float(co.z)))
+
+        normals = []
+        # Average corner normals per vertex for Unity Mesh.normals (Blender 5: loop.normal).
+        accum = [[0.0, 0.0, 0.0] for _ in range(len(mesh.vertices))]
+        counts = [0] * len(mesh.vertices)
+        for loop in mesh.loops:
+            n = loop.normal
+            idx = loop.vertex_index
+            accum[idx][0] += float(n.x)
+            accum[idx][1] += float(n.y)
+            accum[idx][2] += float(n.z)
+            counts[idx] += 1
+        for i, (ax, ay, az) in enumerate(accum):
+            c = counts[i] or 1
+            x, y, z = ax / c, ay / c, az / c
+            length = math.sqrt(x * x + y * y + z * z) or 1.0
+            normals.extend((x / length, y / length, z / length))
+
+        uvs = []
+        uv_layer = mesh.uv_layers.active
+        if uv_layer is not None:
+            uv_per_vert = [(0.0, 0.0)] * len(mesh.vertices)
+            seen = [False] * len(mesh.vertices)
+            for loop in mesh.loops:
+                vi = loop.vertex_index
+                if seen[vi]:
+                    continue
+                uv = uv_layer.data[loop.index].uv
+                uv_per_vert[vi] = (float(uv.x), float(uv.y))
+                seen[vi] = True
+            for u, v in uv_per_vert:
+                uvs.extend((u, v))
+
+        triangles = []
+        for tri in mesh.loop_triangles:
+            triangles.extend((int(tri.vertices[0]), int(tri.vertices[1]), int(tri.vertices[2])))
+
+        existing = {}
+        if os.path.isfile(filepath):
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+
+        payload = {
+            "version": 1,
+            "name": existing.get("name") or target.name,
+            "unity_asset_path": existing.get("unity_asset_path") or "",
+            "vertex_count": len(mesh.vertices),
+            "vertices": vertices,
+            "normals": normals,
+            "uvs": uvs,
+            "triangles": triangles,
+            "submesh_count": 1,
+            "submesh_index_counts": [len(triangles)],
+        }
+
+        # Atomic replace so Unity's FileSystemWatcher sees a complete file.
+        tmp_path = filepath + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, filepath)
+        print(
+            f"BLENDER_BRIDGE: bridge-mesh export v{_BRIDGE_SCRIPT_VERSION} "
+            f"verts={payload['vertex_count']} tris={len(triangles) // 3} -> {filepath}"
+        )
+    finally:
+        eval_obj.to_mesh_clear()
+
+
 class UnityModelExporter:
     def __init__(self, model_path):
         self.model_path = model_path
         self.filename = os.path.basename(model_path)
-        self.extension = os.path.splitext(model_path)[1].lower()
+        self.extension = _resolve_model_format(model_path)
 
     def load_model(self):
         self.model_path = os.path.normpath(self.model_path)
+        self.extension = _resolve_model_format(self.model_path)
         print(f"BLENDER_BRIDGE: load_model v{_BRIDGE_SCRIPT_VERSION} -> {self.filename}")
         _plog(f"load_model begin {self.model_path}")
 
@@ -649,6 +837,10 @@ class UnityModelExporter:
             bpy.ops.wm.obj_import(filepath=self.model_path)
         elif self.extension == ".dae":
             bpy.ops.wm.collada_import(filepath=self.model_path)
+        elif self.extension == _BRIDGE_MESH_SUFFIX:
+            if not _import_unity_bridge_mesh(self.model_path):
+                print(f"BLENDER_BRIDGE_ERROR: bridge-mesh import failed for '{self.filename}'")
+                return
         else:
             print(f"Unsupported format '{self.extension}'")
             return
@@ -787,6 +979,8 @@ class UnityModelExporter:
             )
         elif file_format == ".dae":
             bpy.ops.wm.collada_export(filepath=filepath, apply_modifiers=True)
+        elif file_format == _BRIDGE_MESH_SUFFIX or _is_bridge_mesh_path(filepath):
+            _export_unity_bridge_mesh(filepath)
         else:
             raise ValueError(f"Unsupported export format '{file_format}'")
 
@@ -825,10 +1019,14 @@ class WM_OT_save_unity_model(bpy.types.Operator):
 
 def menu_func_export(self, context):
     if "unity_model_path" in context.scene:
-        file_format = context.scene.get("unity_model_format", ".fbx").upper()
+        file_format = context.scene.get("unity_model_format", ".fbx")
+        if file_format == _BRIDGE_MESH_SUFFIX:
+            label = "Unity Mesh (back to original .mesh asset)"
+        else:
+            label = f"{str(file_format)[1:].upper()} (back to original Unity asset)"
         self.layout.operator(
             WM_OT_save_unity_model.bl_idname,
-            text=f"{file_format[1:]} (back to original Unity asset)",
+            text=label,
             icon="EXPORT",
         )
 

@@ -15,7 +15,7 @@ public static class BlenderBridgeProcessor
     private static readonly bool DEBUG = false; // If false it'll only log errors
 
     private static readonly string BLENDER_PATH = @"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe";
-    private static readonly string[] SUPPORTED_EXTENSIONS = { ".fbx", ".obj", ".dae" };
+    private static readonly string[] SUPPORTED_EXTENSIONS = { ".fbx", ".obj", ".dae", ".mesh" };
 
     /// <summary>Must match blender-bridge-injector default BRIDGE_BLENDER_PORT.</summary>
     private const int BridgeListenPort = 35971;
@@ -119,11 +119,28 @@ public static class BlenderBridgeProcessor
             return false;
         }
 
-        string modelFullPath = ResolveAssetFullPath(assetPath);
-        if (!File.Exists(modelFullPath))
+        string modelFullPath;
+        if (extension == ".mesh")
         {
-            Debug.LogError($"[BlenderBridge] Model file not found: '{modelFullPath}' (asset: '{assetPath}')");
-            return false;
+            if (!(obj is Mesh) && AssetDatabase.LoadAssetAtPath<Mesh>(assetPath) == null)
+            {
+                return false;
+            }
+
+            if (!BlenderBridgeUnityMesh.TryOpen(assetPath, out modelFullPath, out string meshError))
+            {
+                Debug.LogError($"[BlenderBridge] {meshError}");
+                return true;
+            }
+        }
+        else
+        {
+            modelFullPath = ResolveAssetFullPath(assetPath);
+            if (!File.Exists(modelFullPath))
+            {
+                Debug.LogError($"[BlenderBridge] Model file not found: '{modelFullPath}' (asset: '{assetPath}')");
+                return false;
+            }
         }
 
         if (DEBUG)

@@ -4,9 +4,9 @@
 
 ---
 
-Open `.FBX`, `.OBJ`, and `.DAE` files in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
+Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
 
-**Version:** 0.1.3 · **Unity:** 2022.3+ · **Platform:** Windows
+**Version:** 0.1.4 · **Unity:** 2022.3+ · **Platform:** Windows
 
 ## Installing
 
@@ -22,17 +22,18 @@ Open `.FBX`, `.OBJ`, and `.DAE` files in Blender from Unity, then export straigh
 ## Quick start
 
 1. Set your Blender executable path in `Editor/BlenderBridgeProcessor.cs` (see [Configuration](#configuration)).
-2. Double-click an `.fbx`, `.obj`, or `.dae` asset in the Unity Project window.
+2. Double-click an `.fbx`, `.obj`, `.dae`, or `.mesh` asset in the Unity Project window.
 3. Edit the model in Blender.
 4. Press **Ctrl+S** or use **File → Export → … (back to original Unity asset)** to write back to Unity.
 
 ## Features
 
 - **Double-click to edit** — open supported 3D assets directly from the Unity Project window
+- **Unity Mesh (.mesh)** — opens readable Mesh assets via a lossless JSON interchange under `Library/BlenderBridge/` (handles Unity CompressedMesh by reading through the Mesh API)
 - **Hot reuse** — if Blender is already running, the next double-click imports into the same window instead of launching another instance
 - **Auto focus** — when hot-reusing Blender, the window is brought to the foreground automatically
 - **Save back to Unity** — Ctrl+S and the File → Export menu export to the original asset path
-- **Format preserved** — round-trip stays in the same format (FBX / OBJ / DAE)
+- **Format preserved** — round-trip stays in the same format (FBX / OBJ / DAE / Mesh)
 - **Unity-aware FBX** — reads Unity `.meta` importer settings (normals, smooth angle, axis) for better round-trip fidelity
 - **Better FBX support** — uses the [Better FBX Importer & Exporter](https://blendermarket.com/products/better-fbx-importer-exporter) addon when installed; falls back to Blender's built-in FBX importer/exporter
 - **Transform baseline** — restores object transforms before export to reduce rotation drift on save
@@ -90,6 +91,12 @@ TEXTURE_PATH = r"C:\path\to\your\textures"
 
 Textures are matched by material name + extension (`.png`, `.jpg`, etc.).
 
+### Unity Mesh (`.mesh`) requirements
+
+- The Mesh asset must be **Read/Write Enabled** (`isReadable`).
+- Double-clicking a `.mesh` writes a temporary `Library/BlenderBridge/*.bridge-mesh` interchange file, opens it in Blender, and on Ctrl+S writes geometry back into the original Mesh asset.
+- Unity CompressedMesh YAML is never parsed by Blender; Unity decompresses via the Mesh API.
+
 ### Advanced (environment variables)
 
 
@@ -131,9 +138,9 @@ MIT
 
 # Blender Bridge（中文）
 
-在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE` 资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
+在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
 
-**版本：** 0.1.3 · **Unity：** 2022.3+ · **平台：** Windows
+**版本：** 0.1.4 · **Unity：** 2022.3+ · **平台：** Windows
 
 ## 安装
 
@@ -149,17 +156,18 @@ MIT
 ## 快速上手
 
 1. 在 `Editor/BlenderBridgeProcessor.cs` 中设置 Blender 可执行文件路径（见 [配置说明](#配置说明)）。
-2. 在 Unity **Project** 窗口双击 `.fbx`、`.obj` 或 `.dae` 资产。
+2. 在 Unity **Project** 窗口双击 `.fbx`、`.obj`、`.dae` 或 `.mesh` 资产。
 3. 在 Blender 中编辑模型。
 4. 按 **Ctrl+S**，或使用 **File → Export → … (back to original Unity asset)** 导出回 Unity。
 
 ## 功能特性
 
 - **双击编辑** — 从 Unity 工程窗口直接打开支持的 3D 资产
+- **Unity Mesh（.mesh）** — 支持可读 Mesh 资产；通过 `Library/BlenderBridge/` 下的 JSON 中转文件往返（Unity CompressedMesh 由 Mesh API 解压，Blender 不直接解析 YAML）
 - **热复用** — Blender 已在运行时，再次双击会导入到同一窗口，不会重复启动新实例
 - **自动置前** — 热复用导入时，Blender 窗口会自动弹到最前面
 - **保存回 Unity** — Ctrl+S 和导出菜单都会写回原资产路径
-- **格式保持不变** — 往返编辑保持原格式（FBX / OBJ / DAE）
+- **格式保持不变** — 往返编辑保持原格式（FBX / OBJ / DAE / Mesh）
 - **读取 Unity 导入设置** — 从 `.meta` 读取法线、平滑角度、轴向等，提升往返一致性
 - **Better FBX 支持** — 已安装 [Better FBX Importer & Exporter](https://blendermarket.com/products/better-fbx-importer-exporter) 时优先使用；否则回退到 Blender 内置 FBX 导入/导出
 - **变换基线恢复** — 导出前恢复导入时的物体变换，减少旋转漂移
@@ -214,6 +222,12 @@ TEXTURE_PATH = r"C:\path\to\your\textures"
 ```
 
 贴图按 **材质名 + 扩展名**（`.png`、`.jpg` 等）匹配。
+
+### Unity Mesh（`.mesh`）要求
+
+- Mesh 资产必须开启 **Read/Write Enabled**（`isReadable`）。
+- 双击 `.mesh` 时，会在 `Library/BlenderBridge/` 生成 JSON 中转文件 `*.bridge-mesh` 并在 Blender 中打开；Ctrl+S 后把几何写回原 Mesh 资产。
+- Blender 不直接解析 Unity CompressedMesh YAML，而是由 Unity Mesh API 解压后再中转。
 
 ### 高级选项（环境变量）
 
