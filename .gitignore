@@ -1,0 +1,6 @@
+# Local Python / Unity noise — must not ship inside the UPM package
+Editor/__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
