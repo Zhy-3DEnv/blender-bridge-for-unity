@@ -6,7 +6,7 @@
 
 Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
 
-**Version:** 0.1.4 · **Unity:** 2022.3+ · **Platform:** Windows
+**Version:** 0.1.5 · **Unity:** 2022.3+ · **Platform:** Windows
 
 ## Installing
 
@@ -140,7 +140,7 @@ MIT
 
 在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
 
-**版本：** 0.1.4 · **Unity：** 2022.3+ · **平台：** Windows
+**版本：** 0.1.5 · **Unity：** 2022.3+ · **平台：** Windows
 
 ## 安装
 

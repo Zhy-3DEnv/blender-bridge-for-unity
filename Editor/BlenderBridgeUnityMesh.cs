@@ -16,7 +16,7 @@ public static class BlenderBridgeUnityMesh
 {
     public const string InterchangeExtension = ".bridge-mesh";
 
-    private const int BridgeMeshVersion = 1;
+    private const int BridgeMeshVersion = 2;
     private static readonly Dictionary<string, string> PendingByInterchange =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -92,7 +92,6 @@ public static class BlenderBridgeUnityMesh
     {
         Vector3[] vertices = mesh.vertices;
         Vector3[] normals = mesh.normals;
-        Vector2[] uvs = mesh.uv;
         int[] triangles = mesh.triangles;
 
         var data = new BridgeMeshData
@@ -103,7 +102,14 @@ public static class BlenderBridgeUnityMesh
             vertex_count = vertices.Length,
             vertices = Flatten(vertices),
             normals = normals != null && normals.Length == vertices.Length ? Flatten(normals) : Array.Empty<float>(),
-            uvs = uvs != null && uvs.Length == vertices.Length ? Flatten(uvs) : Array.Empty<float>(),
+            uvs = CaptureUvChannel(mesh, 0, vertices.Length),
+            uvs2 = CaptureUvChannel(mesh, 1, vertices.Length),
+            uvs3 = CaptureUvChannel(mesh, 2, vertices.Length),
+            uvs4 = CaptureUvChannel(mesh, 3, vertices.Length),
+            uvs5 = CaptureUvChannel(mesh, 4, vertices.Length),
+            uvs6 = CaptureUvChannel(mesh, 5, vertices.Length),
+            uvs7 = CaptureUvChannel(mesh, 6, vertices.Length),
+            uvs8 = CaptureUvChannel(mesh, 7, vertices.Length),
             triangles = triangles ?? Array.Empty<int>(),
             submesh_count = mesh.subMeshCount,
             submesh_index_counts = new int[mesh.subMeshCount]
@@ -115,6 +121,18 @@ public static class BlenderBridgeUnityMesh
         }
 
         return data;
+    }
+
+    private static float[] CaptureUvChannel(Mesh mesh, int channel, int vertexCount)
+    {
+        var uvs = new List<Vector2>(vertexCount);
+        mesh.GetUVs(channel, uvs);
+        if (uvs.Count != vertexCount)
+        {
+            return Array.Empty<float>();
+        }
+
+        return Flatten(uvs.ToArray());
     }
 
     private static void WriteInterchange(string path, BridgeMeshData data)
@@ -291,12 +309,19 @@ public static class BlenderBridgeUnityMesh
             AssetDatabase.SaveAssets();
             Debug.Log(
                 $"[BlenderBridge] Wrote Blender edits back to Mesh '{assetPath}' " +
-                $"({data.vertex_count} verts, {data.triangles?.Length / 3 ?? 0} tris)");
+                $"({data.vertex_count} verts, {data.triangles?.Length / 3 ?? 0} tris, " +
+                $"uvs={HasUv(data.uvs, data.vertex_count)} " +
+                $"uvs2={HasUv(data.uvs2, data.vertex_count)})");
         }
         catch (Exception ex)
         {
             Debug.LogError($"[BlenderBridge] Mesh write-back failed for '{interchangeFullPath}': {ex.Message}");
         }
+    }
+
+    private static bool HasUv(float[] uvs, int vertexCount)
+    {
+        return uvs != null && vertexCount > 0 && uvs.Length == vertexCount * 2;
     }
 
     private static void ApplyBridgeDataToMesh(Mesh mesh, BridgeMeshData data)
@@ -331,10 +356,14 @@ public static class BlenderBridgeUnityMesh
             mesh.normals = Unflatten3(data.normals, vertexCount);
         }
 
-        if (data.uvs != null && data.uvs.Length == vertexCount * 2)
-        {
-            mesh.uv = Unflatten2(data.uvs, vertexCount);
-        }
+        ApplyUvChannel(mesh, 0, data.uvs, vertexCount);
+        ApplyUvChannel(mesh, 1, data.uvs2, vertexCount);
+        ApplyUvChannel(mesh, 2, data.uvs3, vertexCount);
+        ApplyUvChannel(mesh, 3, data.uvs4, vertexCount);
+        ApplyUvChannel(mesh, 4, data.uvs5, vertexCount);
+        ApplyUvChannel(mesh, 5, data.uvs6, vertexCount);
+        ApplyUvChannel(mesh, 6, data.uvs7, vertexCount);
+        ApplyUvChannel(mesh, 7, data.uvs8, vertexCount);
 
         int submeshCount = data.submesh_count > 0 ? data.submesh_count : 1;
         if (data.submesh_index_counts != null
@@ -365,6 +394,16 @@ public static class BlenderBridgeUnityMesh
 
         mesh.RecalculateBounds();
         mesh.RecalculateTangents();
+    }
+
+    private static void ApplyUvChannel(Mesh mesh, int channel, float[] flat, int vertexCount)
+    {
+        if (flat == null || flat.Length != vertexCount * 2)
+        {
+            return;
+        }
+
+        mesh.SetUVs(channel, Unflatten2(flat, vertexCount));
     }
 
     private static bool WaitForFileReady(string path, int attempts, int delayMs)
@@ -460,6 +499,13 @@ public static class BlenderBridgeUnityMesh
         public float[] vertices;
         public float[] normals;
         public float[] uvs;
+        public float[] uvs2;
+        public float[] uvs3;
+        public float[] uvs4;
+        public float[] uvs5;
+        public float[] uvs6;
+        public float[] uvs7;
+        public float[] uvs8;
         public int[] triangles;
         public int submesh_count;
         public int[] submesh_index_counts;

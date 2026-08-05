@@ -34,7 +34,7 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.8"
+_BRIDGE_SCRIPT_VERSION = "2.9"
 _BRIDGE_MESH_SUFFIX = ".bridge-mesh"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
@@ -688,11 +688,25 @@ def _import_unity_bridge_mesh(path: str) -> bool:
 
     uvs_flat = data.get("uvs") or []
     if len(uvs_flat) == vertex_count * 2 and mesh.polygons:
-        uv_layer = mesh.uv_layers.new(name="UVMap")
-        for poly in mesh.polygons:
-            for loop_idx in poly.loop_indices:
-                vi = mesh.loops[loop_idx].vertex_index
-                uv_layer.data[loop_idx].uv = (uvs_flat[vi * 2], uvs_flat[vi * 2 + 1])
+        _assign_bridge_uv_layer(mesh, "UVMap", uvs_flat, vertex_count)
+
+        for key, layer_name in (
+            ("uvs2", "UV2"),
+            ("uvs3", "UV3"),
+            ("uvs4", "UV4"),
+            ("uvs5", "UV5"),
+            ("uvs6", "UV6"),
+            ("uvs7", "UV7"),
+            ("uvs8", "UV8"),
+        ):
+            channel_flat = data.get(key) or []
+            if len(channel_flat) == vertex_count * 2 and mesh.polygons:
+                _assign_bridge_uv_layer(mesh, layer_name, channel_flat, vertex_count)
+            elif channel_flat:
+                print(
+                    f"BLENDER_BRIDGE_WARN: skip {key} "
+                    f"(len={len(channel_flat)}, expected {vertex_count * 2})"
+                )
 
     for poly in mesh.polygons:
         poly.use_smooth = True
@@ -703,11 +717,41 @@ def _import_unity_bridge_mesh(path: str) -> bool:
     obj.select_set(True)
 
     unity_asset = data.get("unity_asset_path") or ""
+    uv_names = [layer.name for layer in mesh.uv_layers]
     print(
         f"BLENDER_BRIDGE: bridge-mesh import v{_BRIDGE_SCRIPT_VERSION} "
-        f"name={name!r} verts={vertex_count} tris={len(faces)} unity={unity_asset!r}"
+        f"name={name!r} verts={vertex_count} tris={len(faces)} "
+        f"uv_layers={uv_names} unity={unity_asset!r}"
     )
     return True
+
+
+def _assign_bridge_uv_layer(mesh, layer_name: str, uvs_flat: list, vertex_count: int) -> None:
+    uv_layer = mesh.uv_layers.new(name=layer_name)
+    for poly in mesh.polygons:
+        for loop_idx in poly.loop_indices:
+            vi = mesh.loops[loop_idx].vertex_index
+            if vi < 0 or vi >= vertex_count:
+                continue
+            uv_layer.data[loop_idx].uv = (uvs_flat[vi * 2], uvs_flat[vi * 2 + 1])
+
+
+def _export_uv_channel_flat(mesh, uv_layer) -> list:
+    if uv_layer is None:
+        return []
+    uv_per_vert = [(0.0, 0.0)] * len(mesh.vertices)
+    seen = [False] * len(mesh.vertices)
+    for loop in mesh.loops:
+        vi = loop.vertex_index
+        if seen[vi]:
+            continue
+        uv = uv_layer.data[loop.index].uv
+        uv_per_vert[vi] = (float(uv.x), float(uv.y))
+        seen[vi] = True
+    flat = []
+    for u, v in uv_per_vert:
+        flat.extend((u, v))
+    return flat
 
 
 def _export_unity_bridge_mesh(filepath: str) -> None:
@@ -752,20 +796,12 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             length = math.sqrt(x * x + y * y + z * z) or 1.0
             normals.extend((x / length, y / length, z / length))
 
-        uvs = []
-        uv_layer = mesh.uv_layers.active
-        if uv_layer is not None:
-            uv_per_vert = [(0.0, 0.0)] * len(mesh.vertices)
-            seen = [False] * len(mesh.vertices)
-            for loop in mesh.loops:
-                vi = loop.vertex_index
-                if seen[vi]:
-                    continue
-                uv = uv_layer.data[loop.index].uv
-                uv_per_vert[vi] = (float(uv.x), float(uv.y))
-                seen[vi] = True
-            for u, v in uv_per_vert:
-                uvs.extend((u, v))
+        # Preserve UV layer order: UVMap/first -> uvs, UV2/second -> uvs2, ...
+        uv_flats = []
+        for layer in mesh.uv_layers:
+            uv_flats.append(_export_uv_channel_flat(mesh, layer))
+        while len(uv_flats) < 8:
+            uv_flats.append([])
 
         triangles = []
         for tri in mesh.loop_triangles:
@@ -780,17 +816,30 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
                 existing = {}
 
         payload = {
-            "version": 1,
+            "version": 2,
             "name": existing.get("name") or target.name,
             "unity_asset_path": existing.get("unity_asset_path") or "",
             "vertex_count": len(mesh.vertices),
             "vertices": vertices,
             "normals": normals,
-            "uvs": uvs,
+            "uvs": uv_flats[0],
+            "uvs2": uv_flats[1],
+            "uvs3": uv_flats[2],
+            "uvs4": uv_flats[3],
+            "uvs5": uv_flats[4],
+            "uvs6": uv_flats[5],
+            "uvs7": uv_flats[6],
+            "uvs8": uv_flats[7],
             "triangles": triangles,
-            "submesh_count": 1,
-            "submesh_index_counts": [len(triangles)],
+            "submesh_count": int(existing.get("submesh_count") or 1),
+            "submesh_index_counts": existing.get("submesh_index_counts")
+            or [len(triangles)],
         }
+        # If triangle count no longer matches preserved submesh layout, fall back to one submesh.
+        sub_counts = payload["submesh_index_counts"] or []
+        if not isinstance(sub_counts, list) or sum(int(c) for c in sub_counts) != len(triangles):
+            payload["submesh_count"] = 1
+            payload["submesh_index_counts"] = [len(triangles)]
 
         # Atomic replace so Unity's FileSystemWatcher sees a complete file.
         tmp_path = filepath + ".tmp"
@@ -798,9 +847,11 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             json.dump(payload, f, indent=2)
             f.write("\n")
         os.replace(tmp_path, filepath)
+        present = [i + 1 for i, flat in enumerate(uv_flats) if flat]
         print(
             f"BLENDER_BRIDGE: bridge-mesh export v{_BRIDGE_SCRIPT_VERSION} "
-            f"verts={payload['vertex_count']} tris={len(triangles) // 3} -> {filepath}"
+            f"verts={payload['vertex_count']} tris={len(triangles) // 3} "
+            f"uv_channels={present} -> {filepath}"
         )
     finally:
         eval_obj.to_mesh_clear()
