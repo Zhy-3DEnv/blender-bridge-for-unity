@@ -96,6 +96,7 @@ Textures are matched by material name + extension (`.png`, `.jpg`, etc.).
 - The Mesh asset must be **Read/Write Enabled** (`isReadable`).
 - Double-clicking a `.mesh` writes a temporary `Library/BlenderBridge/*.bridge-mesh` interchange file, opens it in Blender, and on Ctrl+S writes geometry back into the original Mesh asset.
 - Unity CompressedMesh YAML is never parsed by Blender; Unity decompresses via the Mesh API.
+- When a face's normal is flipped in Blender, unchanged vertices keep their original Unity normals; only the flipped face's shared vertices are split so adjacent faces keep their previous shading.
 
 ### Advanced (environment variables)
 
@@ -228,6 +229,7 @@ TEXTURE_PATH = r"C:\path\to\your\textures"
 - Mesh 资产必须开启 **Read/Write Enabled**（`isReadable`）。
 - 双击 `.mesh` 时，会在 `Library/BlenderBridge/` 生成 JSON 中转文件 `*.bridge-mesh` 并在 Blender 中打开；Ctrl+S 后把几何写回原 Mesh 资产。
 - Blender 不直接解析 Unity CompressedMesh YAML，而是由 Unity Mesh API 解压后再中转。
+- 在 Blender 中翻转某个面的法线时，未改动的顶点会保留原有 Unity 法线；仅被翻转面共用的顶点会被拆分，从而让相邻面的原有光照保持不变。
 
 ### 高级选项（环境变量）
 

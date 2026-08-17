@@ -34,8 +34,10 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.9"
+_BRIDGE_SCRIPT_VERSION = "2.10"
 _BRIDGE_MESH_SUFFIX = ".bridge-mesh"
+_BRIDGE_NORMAL_BASELINE_SUFFIX = ".normal-baseline"
+_BRIDGE_POSITION_EPSILON = 1e-5
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -723,6 +725,7 @@ def _import_unity_bridge_mesh(path: str) -> bool:
         f"name={name!r} verts={vertex_count} tris={len(faces)} "
         f"uv_layers={uv_names} unity={unity_asset!r}"
     )
+    _write_bridge_normal_baseline(path, data)
     return True
 
 
@@ -734,6 +737,154 @@ def _assign_bridge_uv_layer(mesh, layer_name: str, uvs_flat: list, vertex_count:
             if vi < 0 or vi >= vertex_count:
                 continue
             uv_layer.data[loop_idx].uv = (uvs_flat[vi * 2], uvs_flat[vi * 2 + 1])
+
+
+def _bridge_normal_baseline_path(filepath: str) -> str:
+    return filepath + _BRIDGE_NORMAL_BASELINE_SUFFIX
+
+
+def _write_bridge_normal_baseline(filepath: str, data: dict) -> None:
+    """Snapshot original Unity normals/vertices/triangles before Blender edits."""
+    baseline = {
+        "version": 1,
+        "unity_asset_path": data.get("unity_asset_path") or "",
+        "name": data.get("name") or "",
+        "vertex_count": data.get("vertex_count") or 0,
+        "vertices": data.get("vertices") or [],
+        "normals": data.get("normals") or [],
+        "triangles": data.get("triangles") or [],
+    }
+    baseline_path = _bridge_normal_baseline_path(filepath)
+    tmp_path = baseline_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(baseline, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, baseline_path)
+    except OSError as ex:
+        print(f"BLENDER_BRIDGE_WARN: failed to write normal baseline: {ex}")
+
+
+def _read_bridge_normal_baseline(filepath: str) -> dict:
+    """Return the original mesh snapshot; fall back to the current interchange file."""
+    candidates = [_bridge_normal_baseline_path(filepath), filepath]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        vertex_count = int(data.get("vertex_count") or 0)
+        vertices = data.get("vertices") or []
+        normals = data.get("normals") or []
+        triangles = data.get("triangles") or []
+        if not vertex_count:
+            vertex_count = len(vertices) // 3 if isinstance(vertices, list) else 0
+        if (
+            isinstance(vertices, list)
+            and isinstance(normals, list)
+            and isinstance(triangles, list)
+            and len(vertices) == vertex_count * 3
+            and len(normals) == vertex_count * 3
+            and len(triangles) % 3 == 0
+        ):
+            return {
+                "vertex_count": vertex_count,
+                "vertices": vertices,
+                "normals": normals,
+                "triangles": triangles,
+            }
+    return {}
+
+
+def _tri_key(tri: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(sorted(tri))
+
+
+def _tri_orientation(tri: tuple[int, int, int]) -> int | None:
+    """Return 0/1 winding sign relative to sorted vertex order; None if degenerate."""
+    if len(tri) != 3 or len(set(tri)) != 3:
+        return None
+    inversions = 0
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if tri[i] > tri[j]:
+                inversions += 1
+    return inversions % 2
+
+
+def _match_triangle_orientations(
+    current_tris: list[tuple[int, int, int]],
+    baseline_tris: list[tuple[int, int, int]],
+) -> list[bool] | None:
+    """Return True=same winding, False=flipped, or None if topology differs."""
+    if len(current_tris) != len(baseline_tris):
+        return None
+
+    baseline_by_key: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+    for tri in baseline_tris:
+        baseline_by_key.setdefault(_tri_key(tri), []).append(tri)
+
+    flags: list[bool] = []
+    for tri in current_tris:
+        key = _tri_key(tri)
+        pool = baseline_by_key.get(key)
+        if not pool:
+            return None
+        baseline_tri = pool.pop(0)
+        cur_orient = _tri_orientation(tri)
+        base_orient = _tri_orientation(baseline_tri)
+        if cur_orient is None or base_orient is None:
+            return None
+        flags.append(cur_orient == base_orient)
+    return flags
+
+
+def _normalize_vector3(values: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(values[0] * values[0] + values[1] * values[1] + values[2] * values[2]) or 1.0
+    return (values[0] / length, values[1] / length, values[2] / length)
+
+
+def _negate_vector3(values: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (-values[0], -values[1], -values[2])
+
+
+def _vectors_close(a: list[float], b: list[float], epsilon: float = _BRIDGE_POSITION_EPSILON) -> bool:
+    if len(a) != 3 or len(b) != 3:
+        return False
+    return (
+        abs(a[0] - b[0]) <= epsilon
+        and abs(a[1] - b[1]) <= epsilon
+        and abs(a[2] - b[2]) <= epsilon
+    )
+
+
+def _average_loop_normals_per_vertex(mesh) -> list[tuple[float, float, float]]:
+    accum = [[0.0, 0.0, 0.0] for _ in range(len(mesh.vertices))]
+    counts = [0] * len(mesh.vertices)
+    for loop in mesh.loops:
+        n = loop.normal
+        idx = loop.vertex_index
+        accum[idx][0] += float(n.x)
+        accum[idx][1] += float(n.y)
+        accum[idx][2] += float(n.z)
+        counts[idx] += 1
+
+    result = []
+    for i, (ax, ay, az) in enumerate(accum):
+        c = counts[i] or 1
+        result.append(_normalize_vector3((ax / c, ay / c, az / c)))
+    return result
+
+
+def _flatten_vec3_list(values: list[tuple[float, float, float]]) -> list[float]:
+    flat: list[float] = []
+    for x, y, z in values:
+        flat.extend((float(x), float(y), float(z)))
+    return flat
 
 
 def _export_uv_channel_flat(mesh, uv_layer) -> list:
@@ -774,38 +925,138 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
         mesh.calc_loop_triangles()
 
         # Preserve Unity coordinates: use object-local mesh data (no axis conversion).
-        vertices = []
+        current_vertices = []
         for v in mesh.vertices:
             co = v.co
-            vertices.extend((float(co.x), float(co.y), float(co.z)))
-
-        normals = []
-        # Average corner normals per vertex for Unity Mesh.normals (Blender 5: loop.normal).
-        accum = [[0.0, 0.0, 0.0] for _ in range(len(mesh.vertices))]
-        counts = [0] * len(mesh.vertices)
-        for loop in mesh.loops:
-            n = loop.normal
-            idx = loop.vertex_index
-            accum[idx][0] += float(n.x)
-            accum[idx][1] += float(n.y)
-            accum[idx][2] += float(n.z)
-            counts[idx] += 1
-        for i, (ax, ay, az) in enumerate(accum):
-            c = counts[i] or 1
-            x, y, z = ax / c, ay / c, az / c
-            length = math.sqrt(x * x + y * y + z * z) or 1.0
-            normals.extend((x / length, y / length, z / length))
+            current_vertices.append((float(co.x), float(co.y), float(co.z)))
 
         # Preserve UV layer order: UVMap/first -> uvs, UV2/second -> uvs2, ...
-        uv_flats = []
+        current_uv_flats = []
         for layer in mesh.uv_layers:
-            uv_flats.append(_export_uv_channel_flat(mesh, layer))
-        while len(uv_flats) < 8:
-            uv_flats.append([])
+            current_uv_flats.append(_export_uv_channel_flat(mesh, layer))
+        while len(current_uv_flats) < 8:
+            current_uv_flats.append([])
 
-        triangles = []
-        for tri in mesh.loop_triangles:
-            triangles.extend((int(tri.vertices[0]), int(tri.vertices[1]), int(tri.vertices[2])))
+        current_tri_objects = list(mesh.loop_triangles)
+        current_tri_tuples = [tuple(int(v) for v in tri.vertices) for tri in current_tri_objects]
+        current_avg_normals = _average_loop_normals_per_vertex(mesh)
+
+        baseline = _read_bridge_normal_baseline(filepath)
+        orientation_flags = None
+        baseline_vertices_flat = baseline.get("vertices") or []
+        baseline_normals_flat = baseline.get("normals") or []
+        baseline_tris_flat = baseline.get("triangles") or []
+        baseline_vertex_count = int(baseline.get("vertex_count") or 0)
+        if baseline_vertex_count != len(current_vertices):
+            baseline_vertex_count = len(baseline_vertices_flat) // 3
+
+        baseline_tri_tuples = [
+            tuple(int(x) for x in baseline_tris_flat[i : i + 3])
+            for i in range(0, len(baseline_tris_flat) - 2, 3)
+        ]
+        positions_match = (
+            baseline_vertex_count == len(current_vertices)
+            and len(baseline_vertices_flat) == baseline_vertex_count * 3
+            and len(baseline_normals_flat) == baseline_vertex_count * 3
+            and len(baseline_tri_tuples) == len(current_tri_tuples)
+        )
+        if positions_match:
+            positions_match = all(
+                _vectors_close(
+                    current_vertices[i],
+                    [
+                        float(baseline_vertices_flat[i * 3]),
+                        float(baseline_vertices_flat[i * 3 + 1]),
+                        float(baseline_vertices_flat[i * 3 + 2]),
+                    ],
+                )
+                for i in range(len(current_vertices))
+            )
+
+        if positions_match:
+            orientation_flags = _match_triangle_orientations(
+                current_tri_tuples, baseline_tri_tuples
+            )
+
+        has_winding_changes = orientation_flags is not None and not all(orientation_flags)
+        if not has_winding_changes:
+            # No flipped faces (or topology/positions changed): keep Blender's current normals.
+            normal_mode = "blender-current"
+            out_vertex_tuples = list(current_vertices)
+            out_normal_tuples = list(current_avg_normals)
+            out_triangles = []
+            for tri in current_tri_tuples:
+                out_triangles.extend(tri)
+            out_uv_flats = [list(flat) for flat in current_uv_flats]
+        else:
+            normal_mode = "preserve-winding"
+            baseline_normals = []
+            for i in range(baseline_vertex_count):
+                baseline_normals.append(
+                    _normalize_vector3(
+                        (
+                            float(baseline_normals_flat[i * 3]),
+                            float(baseline_normals_flat[i * 3 + 1]),
+                            float(baseline_normals_flat[i * 3 + 2]),
+                        )
+                    )
+                )
+
+            unflipped_count = [0] * len(current_vertices)
+            flipped_count = [0] * len(current_vertices)
+            for tri, is_same in zip(current_tri_tuples, orientation_flags):
+                for vi in tri:
+                    if is_same:
+                        unflipped_count[vi] += 1
+                    else:
+                        flipped_count[vi] += 1
+
+            out_vertex_tuples = list(current_vertices)
+            out_normal_tuples = []
+            for vi in range(len(current_vertices)):
+                if unflipped_count[vi] > 0:
+                    out_normal_tuples.append(baseline_normals[vi])
+                elif flipped_count[vi] > 0:
+                    # Every adjacent face was flipped; use Blender's resulting normal.
+                    out_normal_tuples.append(_negate_vector3(baseline_normals[vi]))
+                else:
+                    out_normal_tuples.append(baseline_normals[vi])
+
+            out_triangles = []
+            out_uv_flats = [list(flat) for flat in current_uv_flats]
+            original_vertex_count = len(current_vertices)
+            channel_present = [
+                len(flat) == original_vertex_count * 2 for flat in out_uv_flats
+            ]
+
+            for tri, is_same in zip(current_tri_tuples, orientation_flags):
+                new_tri = []
+                if is_same:
+                    new_tri.extend(tri)
+                else:
+                    for vi in tri:
+                        mixed = unflipped_count[vi] > 0 and flipped_count[vi] > 0
+                        if not mixed:
+                            new_tri.append(vi)
+                            continue
+
+                        new_index = len(out_vertex_tuples)
+                        out_vertex_tuples.append(current_vertices[vi])
+                        out_normal_tuples.append(_negate_vector3(baseline_normals[vi]))
+                        for channel_index, flat in enumerate(out_uv_flats):
+                            if channel_present[channel_index]:
+                                flat.extend(
+                                    (
+                                        flat[vi * 2],
+                                        flat[vi * 2 + 1],
+                                    )
+                                )
+                        new_tri.append(new_index)
+                out_triangles.extend(new_tri)
+
+        vertices = _flatten_vec3_list(out_vertex_tuples)
+        normals = _flatten_vec3_list(out_normal_tuples)
+        triangles = out_triangles
 
         existing = {}
         if os.path.isfile(filepath):
@@ -819,17 +1070,17 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             "version": 2,
             "name": existing.get("name") or target.name,
             "unity_asset_path": existing.get("unity_asset_path") or "",
-            "vertex_count": len(mesh.vertices),
+            "vertex_count": len(out_vertex_tuples),
             "vertices": vertices,
             "normals": normals,
-            "uvs": uv_flats[0],
-            "uvs2": uv_flats[1],
-            "uvs3": uv_flats[2],
-            "uvs4": uv_flats[3],
-            "uvs5": uv_flats[4],
-            "uvs6": uv_flats[5],
-            "uvs7": uv_flats[6],
-            "uvs8": uv_flats[7],
+            "uvs": out_uv_flats[0],
+            "uvs2": out_uv_flats[1],
+            "uvs3": out_uv_flats[2],
+            "uvs4": out_uv_flats[3],
+            "uvs5": out_uv_flats[4],
+            "uvs6": out_uv_flats[5],
+            "uvs7": out_uv_flats[6],
+            "uvs8": out_uv_flats[7],
             "triangles": triangles,
             "submesh_count": int(existing.get("submesh_count") or 1),
             "submesh_index_counts": existing.get("submesh_index_counts")
@@ -847,11 +1098,15 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             json.dump(payload, f, indent=2)
             f.write("\n")
         os.replace(tmp_path, filepath)
-        present = [i + 1 for i, flat in enumerate(uv_flats) if flat]
+        present = [
+            i + 1
+            for i, flat in enumerate(out_uv_flats)
+            if len(flat) == len(out_vertex_tuples) * 2
+        ]
         print(
             f"BLENDER_BRIDGE: bridge-mesh export v{_BRIDGE_SCRIPT_VERSION} "
             f"verts={payload['vertex_count']} tris={len(triangles) // 3} "
-            f"uv_channels={present} -> {filepath}"
+            f"normals={normal_mode} uv_channels={present} -> {filepath}"
         )
     finally:
         eval_obj.to_mesh_clear()
