@@ -447,6 +447,15 @@ def _finalize_imported_normals_for_unity(asset_path: str) -> None:
         mesh = obj.data
         mesh_count += 1
 
+        has_custom = bool(getattr(mesh, "has_custom_normals", False))
+        if has_custom:
+            custom_count += 1
+            # Better FBX Import keeps Unity corner normals / hard edges. Do not
+            # force all faces smooth here, otherwise Blender recomputes them and
+            # destroys the FBX smoothing groups.
+            mesh.update()
+            continue
+
         for poly in mesh.polygons:
             poly.use_smooth = True
 
@@ -454,12 +463,6 @@ def _finalize_imported_normals_for_unity(asset_path: str) -> None:
         for edge in mesh.edges:
             edge.use_edge_sharp = False
         cleared_sharp += before_sharp
-
-        has_custom = bool(getattr(mesh, "has_custom_normals", False))
-        if has_custom:
-            custom_count += 1
-            mesh.update()
-            continue
 
         if unity_mode in ("Calculate", "None") and hasattr(bpy.ops.object, "shade_smooth_by_angle"):
             view_layer.objects.active = obj
