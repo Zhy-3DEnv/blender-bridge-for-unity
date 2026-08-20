@@ -928,6 +928,63 @@ def _average_loop_normals_per_vertex(mesh) -> list[tuple[float, float, float]]:
     return result
 
 
+def _match_baseline_normals_by_position(
+    current_vertices: list[tuple[float, float, float]],
+    baseline_vertices_flat: list[float],
+    baseline_normals_flat: list[float],
+) -> dict[int, tuple[float, float, float]]:
+    """Map unchanged vertices back to their original Unity normals by position."""
+    if (
+        len(baseline_vertices_flat) < 3
+        or len(baseline_vertices_flat) % 3 != 0
+        or len(baseline_normals_flat) != len(baseline_vertices_flat)
+    ):
+        return {}
+
+    baseline_count = len(baseline_vertices_flat) // 3
+    by_position: dict[tuple[float, float, float], list[int]] = {}
+    for bi in range(baseline_count):
+        key = (
+            round(float(baseline_vertices_flat[bi * 3]), 6),
+            round(float(baseline_vertices_flat[bi * 3 + 1]), 6),
+            round(float(baseline_vertices_flat[bi * 3 + 2]), 6),
+        )
+        by_position.setdefault(key, []).append(bi)
+
+    used = [False] * baseline_count
+    matched: dict[int, tuple[float, float, float]] = {}
+    for vi, pos in enumerate(current_vertices):
+        key = (
+            round(float(pos[0]), 6),
+            round(float(pos[1]), 6),
+            round(float(pos[2]), 6),
+        )
+        candidates = by_position.get(key)
+        if not candidates:
+            continue
+
+        chosen = None
+        if vi < baseline_count and not used[vi]:
+            chosen = vi
+        else:
+            for bi in candidates:
+                if not used[bi]:
+                    chosen = bi
+                    break
+        if chosen is None:
+            continue
+
+        used[chosen] = True
+        matched[vi] = _normalize_vector3(
+            (
+                float(baseline_normals_flat[chosen * 3]),
+                float(baseline_normals_flat[chosen * 3 + 1]),
+                float(baseline_normals_flat[chosen * 3 + 2]),
+            )
+        )
+    return matched
+
+
 def _flatten_vec3_list(values: list[tuple[float, float, float]]) -> list[float]:
     flat: list[float] = []
     for x, y, z in values:
@@ -1028,10 +1085,17 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
 
         has_winding_changes = orientation_flags is not None and not all(orientation_flags)
         if not has_winding_changes:
-            # No flipped faces (or topology/positions changed): keep Blender's current normals.
-            normal_mode = "blender-current"
+            # No detected face flips: keep original Unity normals for vertices whose
+            # position is unchanged, and only use Blender's normals for new/moved verts.
+            preserved_normals = _match_baseline_normals_by_position(
+                current_vertices, baseline_vertices_flat, baseline_normals_flat
+            )
+            normal_mode = "preserve-position" if preserved_normals else "blender-current"
             out_vertex_tuples = list(current_vertices)
-            out_normal_tuples = list(current_avg_normals)
+            out_normal_tuples = [
+                preserved_normals.get(vi, current_avg_normals[vi])
+                for vi in range(len(current_vertices))
+            ]
             out_triangles = []
             for tri in current_tri_tuples:
                 out_triangles.extend(tri)
