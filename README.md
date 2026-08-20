@@ -6,7 +6,7 @@
 
 Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
 
-**Version:** 0.1.8 · **Unity:** 2022.3+ · **Platform:** Windows
+**Version:** 0.1.9 · **Unity:** 2022.3+ · **Platform:** Windows
 
 ## Installing
 
@@ -36,7 +36,7 @@ Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Uni
 - **Format preserved** — round-trip stays in the same format (FBX / OBJ / DAE / Mesh)
 - **Unity-aware FBX** — reads Unity `.meta` importer settings (normals, smooth angle, axis) for better round-trip fidelity
 - **Better FBX support** — uses the [Better FBX Importer & Exporter](https://blendermarket.com/products/better-fbx-importer-exporter) addon when installed; falls back to Blender's built-in FBX importer/exporter
-- **Transform baseline** — restores object transforms before export to reduce rotation drift on save
+- **Transform preservation** — restores object transforms before export and bakes static FBX geometric pivots so Unity root rotation/position stay unchanged
 - **Viewport framing** — zooms the 3D view to the imported model
 - **Face select mode** — mesh edit mode defaults to face selection
 - **No splash screen** — Blender opens without the splash
@@ -141,7 +141,7 @@ MIT
 
 在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
 
-**版本：** 0.1.8 · **Unity：** 2022.3+ · **平台：** Windows
+**版本：** 0.1.9 · **Unity：** 2022.3+ · **平台：** Windows
 
 ## 安装
 
@@ -171,7 +171,7 @@ MIT
 - **格式保持不变** — 往返编辑保持原格式（FBX / OBJ / DAE / Mesh）
 - **读取 Unity 导入设置** — 从 `.meta` 读取法线、平滑角度、轴向等，提升往返一致性
 - **Better FBX 支持** — 已安装 [Better FBX Importer & Exporter](https://blendermarket.com/products/better-fbx-importer-exporter) 时优先使用；否则回退到 Blender 内置 FBX 导入/导出
-- **变换基线恢复** — 导出前恢复导入时的物体变换，减少旋转漂移
+- **变换保持** — 导出前恢复物体变换，并烘焙静态 FBX 的几何枢轴，避免 Unity 根节点产生旋转和位移
 - **视口自动聚焦** — 导入后自动缩放到模型
 - **默认面选择模式** — 进入网格编辑时默认为面选择
 - **无启动闪屏** — 打开 Blender 时不显示 Splash

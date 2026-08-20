@@ -34,10 +34,11 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.10"
+_BRIDGE_SCRIPT_VERSION = "2.11"
 _BRIDGE_MESH_SUFFIX = ".bridge-mesh"
 _BRIDGE_NORMAL_BASELINE_SUFFIX = ".normal-baseline"
 _BRIDGE_POSITION_EPSILON = 1e-5
+_BRIDGE_BAKED_STATIC_MARKER = "unity_bridge_baked_static_transform_v1"
 
 # Unity connects here to import into this Blender instead of spawning a new process.
 _bridge_cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -284,6 +285,39 @@ def _resolve_better_fbx_axis(asset_path: str | None) -> str:
     if env_axis in _VALID_BETTER_EXPORT_AXES:
         return env_axis
     return "MayaZUp"
+
+
+def _ascii_fbx_has_geometric_transform(path: str) -> bool:
+    """Detect FBX geometric pivots that Better FBX flattens into Blender transforms."""
+    if not _fbx_is_ascii_text(path):
+        return False
+
+    defaults = {
+        "GeometricTranslation": (0.0, 0.0, 0.0),
+        "GeometricRotation": (0.0, 0.0, 0.0),
+        "GeometricScaling": (1.0, 1.0, 1.0),
+    }
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                for prop, expected in defaults.items():
+                    if f'P: "{prop}"' not in raw:
+                        continue
+                    marker = raw.rfind('""')
+                    if marker < 0:
+                        continue
+                    fields = raw[marker + 2 :].lstrip(" ,\t").split(",")
+                    if len(fields) < 3:
+                        continue
+                    try:
+                        values = tuple(float(fields[i].strip()) for i in range(3))
+                    except ValueError:
+                        continue
+                    if any(abs(values[i] - expected[i]) > 1e-7 for i in range(3)):
+                        return True
+    except OSError:
+        return False
+    return False
 
 
 def _export_optimize_for_game_engine() -> bool:
@@ -562,6 +596,95 @@ def _import_fbx_better_or_builtin(path: str) -> bool:
 
 def _better_export_fbx_available() -> bool:
     return hasattr(bpy.ops, "better_export") and hasattr(bpy.ops.better_export, "fbx")
+
+
+def _should_bake_static_fbx_transform() -> bool:
+    if not bool(bpy.context.scene.get("unity_bridge_requires_baked_static_export", False)):
+        return False
+    meshes = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
+    if len(meshes) != 1 or meshes[0].parent is not None:
+        return False
+    if any(obj.type == "ARMATURE" for obj in bpy.context.scene.objects):
+        return False
+    mesh = meshes[0].data
+    return mesh is not None and getattr(mesh, "shape_keys", None) is None
+
+
+def _export_baked_static_fbx_for_unity(filepath: str) -> bool:
+    """
+    Preserve Unity's identity root for a single static mesh whose source FBX uses
+    GeometricTranslation/Rotation. Better FBX flattens those pivots into Blender's
+    object matrix; exporting that matrix directly makes Unity expose a rotated,
+    translated root. A temporary copy lets Blender bake both the object matrix and
+    the Z-up -> Y-up conversion into mesh data without changing the editable scene.
+    """
+    if not _should_bake_static_fbx_transform():
+        return False
+
+    source_obj = next(obj for obj in bpy.context.scene.objects if obj.type == "MESH")
+    source_mesh = source_obj.data
+    selected = [(obj, obj.select_get()) for obj in bpy.context.scene.objects]
+    previous_active = bpy.context.view_layer.objects.active
+    object_name = source_obj.name
+    mesh_name = source_mesh.name
+    suffix = str(time.time_ns())
+    temp_obj = None
+    temp_mesh = None
+
+    try:
+        temp_obj = source_obj.copy()
+        temp_mesh = source_mesh.copy()
+        temp_obj.data = temp_mesh
+
+        # Free the original names so Unity keeps stable FBX node/mesh identities.
+        source_obj.name = f"__unity_bridge_source_object_{suffix}"
+        source_mesh.name = f"__unity_bridge_source_mesh_{suffix}"
+        temp_obj.name = object_name
+        temp_mesh.name = mesh_name
+        temp_obj[_BRIDGE_BAKED_STATIC_MARKER] = True
+        bpy.context.scene.collection.objects.link(temp_obj)
+
+        bpy.ops.object.select_all(action="DESELECT")
+        temp_obj.select_set(True)
+        bpy.context.view_layer.objects.active = temp_obj
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+        meta = _read_unity_meta_export_settings(filepath)
+        global_scale = max(0.0001, float(meta.get("global_scale") or 1.0))
+        bpy.ops.export_scene.fbx(
+            filepath=filepath,
+            use_selection=True,
+            global_scale=global_scale,
+            apply_unit_scale=True,
+            apply_scale_options="FBX_SCALE_UNITS",
+            object_types={"MESH"},
+            add_leaf_bones=False,
+            bake_anim=False,
+            bake_space_transform=True,
+            use_custom_props=True,
+            axis_forward="-Z",
+            axis_up="Y",
+        )
+        print(
+            f"BLENDER_BRIDGE: exported baked static FBX v{_BRIDGE_SCRIPT_VERSION} "
+            f"geometric_transform=True globalScale={global_scale}"
+        )
+        return True
+    except Exception as ex:
+        print(f"BLENDER_BRIDGE_WARN: baked static FBX export failed, falling back: {ex}")
+        return False
+    finally:
+        if temp_obj is not None and temp_obj.name in bpy.data.objects:
+            bpy.data.objects.remove(temp_obj, do_unlink=True)
+        if temp_mesh is not None and temp_mesh.name in bpy.data.meshes and temp_mesh.users == 0:
+            bpy.data.meshes.remove(temp_mesh)
+        source_obj.name = object_name
+        source_mesh.name = mesh_name
+        for obj, was_selected in selected:
+            if obj.name in bpy.context.scene.objects:
+                obj.select_set(was_selected)
+        if previous_active is not None and previous_active.name in bpy.context.scene.objects:
+            bpy.context.view_layer.objects.active = previous_active
 
 
 def _export_fbx_via_better_unity(filepath: str) -> bool:
@@ -1282,6 +1405,11 @@ class UnityModelExporter:
             print(f"BLENDER_BRIDGE_ERROR: model file not found: {self.model_path!r}")
             return
 
+        requires_baked_static_export = (
+            self.extension == ".fbx"
+            and _ascii_fbx_has_geometric_transform(self.model_path)
+        )
+
         if bpy.context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -1309,6 +1437,13 @@ class UnityModelExporter:
 
         bpy.context.scene["unity_model_path"] = self.model_path
         bpy.context.scene["unity_model_format"] = self.extension
+        requires_baked_static_export = requires_baked_static_export or any(
+            bool(obj.get(_BRIDGE_BAKED_STATIC_MARKER, False))
+            for obj in bpy.context.scene.objects
+        )
+        bpy.context.scene["unity_bridge_requires_baked_static_export"] = (
+            requires_baked_static_export
+        )
 
         bpy.context.tool_settings.mesh_select_mode = (False, False, True)
         bpy.ops.object.select_all(action="SELECT")
@@ -1406,6 +1541,8 @@ class UnityModelExporter:
         _restore_transform_baseline()
 
         if file_format == ".fbx":
+            if _export_baked_static_fbx_for_unity(filepath):
+                return
             if _export_fbx_via_better_unity(filepath):
                 return
             meta = _read_unity_meta_export_settings(filepath)

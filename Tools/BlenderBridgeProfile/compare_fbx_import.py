@@ -9,6 +9,7 @@ import sys
 
 def _mesh_stats() -> list[dict]:
     import bpy
+    from mathutils import Vector
 
     rows = []
     for obj in bpy.context.scene.objects:
@@ -18,6 +19,7 @@ def _mesh_stats() -> list[dict]:
         sharp_edges = sum(1 for e in mesh.edges if e.use_edge_sharp)
         smooth_faces = sum(1 for p in mesh.polygons if p.use_smooth)
         flat_faces = len(mesh.polygons) - smooth_faces
+        world_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
         rows.append(
             {
                 "name": obj.name,
@@ -27,6 +29,11 @@ def _mesh_stats() -> list[dict]:
                 "smooth_faces": smooth_faces,
                 "flat_faces": flat_faces,
                 "custom_normals": bool(getattr(mesh, "has_custom_normals", False)),
+                "parent": obj.parent.name if obj.parent else None,
+                "matrix_local": [list(row) for row in obj.matrix_local],
+                "matrix_world": [list(row) for row in obj.matrix_world],
+                "world_bounds_min": [min(c[i] for c in world_corners) for i in range(3)],
+                "world_bounds_max": [max(c[i] for c in world_corners) for i in range(3)],
             }
         )
     return rows
@@ -74,8 +81,10 @@ def main() -> int:
         return 1
 
     if mode == "builtin":
+        _clear_scene()
         _import_builtin(fbx)
     elif mode == "better":
+        _clear_scene()
         _import_better(fbx)
     else:
         print(json.dumps({"error": f"unknown mode: {mode}"}))
