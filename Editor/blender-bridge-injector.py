@@ -635,6 +635,45 @@ def _resolve_model_format(path: str) -> str:
     return os.path.splitext(path)[1].lower()
 
 
+def _apply_bridge_submeshes(mesh, data: dict, face_count: int) -> int:
+    """Tag every imported face with its Unity submesh index."""
+    submesh_count = int(data.get("submesh_count") or 1)
+    counts = data.get("submesh_index_counts") or []
+    try:
+        counts = [int(c) for c in counts]
+    except (TypeError, ValueError):
+        counts = []
+
+    if len(counts) != submesh_count or sum(counts) != face_count * 3:
+        submesh_count = 1
+        counts = [face_count * 3]
+
+    attr = mesh.attributes.new(name="unity_submesh", type="INT", domain="FACE")
+    offset = 0
+    for submesh_index, count in enumerate(counts):
+        end = offset + count
+        for face_index in range(offset // 3, end // 3):
+            attr.data[face_index].value = submesh_index
+        offset = end
+    return submesh_count
+
+
+def _submesh_indices_by_counts(triangle_count: int, counts) -> list[int] | None:
+    """Rebuild a per-triangle submesh list from Unity index counts."""
+    if not isinstance(counts, list):
+        return None
+    try:
+        counts = [int(c) for c in counts]
+    except (TypeError, ValueError):
+        return None
+    if not counts or sum(counts) != triangle_count * 3:
+        return None
+    out: list[int] = []
+    for submesh_index, count in enumerate(counts):
+        out.extend([submesh_index] * (count // 3))
+    return out
+
+
 def _import_unity_bridge_mesh(path: str) -> bool:
     """Load Unity Mesh interchange JSON written by BlenderBridgeUnityMesh.cs."""
     try:
@@ -673,6 +712,7 @@ def _import_unity_bridge_mesh(path: str) -> bool:
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
+    submesh_count = _apply_bridge_submeshes(mesh, data, len(faces))
 
     normals_flat = data.get("normals") or []
     if len(normals_flat) == vertex_count * 3 and mesh.loops:
@@ -726,7 +766,7 @@ def _import_unity_bridge_mesh(path: str) -> bool:
     print(
         f"BLENDER_BRIDGE: bridge-mesh import v{_BRIDGE_SCRIPT_VERSION} "
         f"name={name!r} verts={vertex_count} tris={len(faces)} "
-        f"uv_layers={uv_names} unity={unity_asset!r}"
+        f"submeshes={submesh_count} uv_layers={uv_names} unity={unity_asset!r}"
     )
     _write_bridge_normal_baseline(path, data)
     return True
@@ -756,6 +796,8 @@ def _write_bridge_normal_baseline(filepath: str, data: dict) -> None:
         "vertices": data.get("vertices") or [],
         "normals": data.get("normals") or [],
         "triangles": data.get("triangles") or [],
+        "submesh_count": int(data.get("submesh_count") or 1),
+        "submesh_index_counts": data.get("submesh_index_counts") or [],
     }
     baseline_path = _bridge_normal_baseline_path(filepath)
     tmp_path = baseline_path + ".tmp"
@@ -794,12 +836,15 @@ def _read_bridge_normal_baseline(filepath: str) -> dict:
             and len(normals) == vertex_count * 3
             and len(triangles) % 3 == 0
         ):
-            return {
+            baseline = {
                 "vertex_count": vertex_count,
                 "vertices": vertices,
                 "normals": normals,
                 "triangles": triangles,
+                "submesh_count": int(data.get("submesh_count") or 1),
+                "submesh_index_counts": data.get("submesh_index_counts") or [],
             }
+            return baseline
     return {}
 
 
@@ -1069,6 +1114,53 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             except Exception:
                 existing = {}
 
+        # Rebuild Unity submeshes from the per-face tag written on import.
+        submesh_attr = None
+        if hasattr(mesh, "attributes"):
+            submesh_attr = mesh.attributes.get("unity_submesh")
+        if submesh_attr is not None and submesh_attr.domain == "FACE":
+            current_tri_submeshes = [
+                int(submesh_attr.data[tri.polygon_index].value)
+                for tri in current_tri_objects
+            ]
+        else:
+            mapped = _submesh_indices_by_counts(
+                len(current_tri_tuples), existing.get("submesh_index_counts") or []
+            )
+            if mapped is None:
+                mapped = _submesh_indices_by_counts(
+                    len(current_tri_tuples), baseline.get("submesh_index_counts") or []
+                )
+            current_tri_submeshes = (
+                mapped if mapped is not None else [0] * len(current_tri_tuples)
+            )
+
+        tri_triples = [
+            tuple(out_triangles[i : i + 3]) for i in range(0, len(out_triangles), 3)
+        ]
+        if len(tri_triples) != len(current_tri_submeshes):
+            current_tri_submeshes = [0] * len(tri_triples)
+
+        baseline_sub_count = int(baseline.get("submesh_count") or 0)
+        existing_sub_count = int(existing.get("submesh_count") or 0)
+        attr_max = max(current_tri_submeshes, default=0)
+        submesh_count = max(baseline_sub_count, existing_sub_count, attr_max + 1)
+        if submesh_count < 1:
+            submesh_count = 1
+
+        grouped = [[] for _ in range(submesh_count)]
+        for tri, submesh_index in zip(tri_triples, current_tri_submeshes):
+            if not 0 <= submesh_index < submesh_count:
+                submesh_index = 0
+            grouped[submesh_index].append(tri)
+
+        triangles = []
+        submesh_index_counts = []
+        for tris in grouped:
+            for tri in tris:
+                triangles.extend(tri)
+            submesh_index_counts.append(len(tris) * 3)
+
         payload = {
             "version": 2,
             "name": existing.get("name") or target.name,
@@ -1085,15 +1177,9 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             "uvs7": out_uv_flats[6],
             "uvs8": out_uv_flats[7],
             "triangles": triangles,
-            "submesh_count": int(existing.get("submesh_count") or 1),
-            "submesh_index_counts": existing.get("submesh_index_counts")
-            or [len(triangles)],
+            "submesh_count": submesh_count,
+            "submesh_index_counts": submesh_index_counts,
         }
-        # If triangle count no longer matches preserved submesh layout, fall back to one submesh.
-        sub_counts = payload["submesh_index_counts"] or []
-        if not isinstance(sub_counts, list) or sum(int(c) for c in sub_counts) != len(triangles):
-            payload["submesh_count"] = 1
-            payload["submesh_index_counts"] = [len(triangles)]
 
         # Atomic replace so Unity's FileSystemWatcher sees a complete file.
         tmp_path = filepath + ".tmp"
@@ -1109,7 +1195,8 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
         print(
             f"BLENDER_BRIDGE: bridge-mesh export v{_BRIDGE_SCRIPT_VERSION} "
             f"verts={payload['vertex_count']} tris={len(triangles) // 3} "
-            f"normals={normal_mode} uv_channels={present} -> {filepath}"
+            f"submeshes={payload['submesh_count']} normals={normal_mode} "
+            f"uv_channels={present} -> {filepath}"
         )
     finally:
         eval_obj.to_mesh_clear()
