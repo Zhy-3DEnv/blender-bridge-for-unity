@@ -14,7 +14,7 @@ public static class BlenderBridgeProcessor
 {
     private static readonly bool DEBUG = false; // If false it'll only log errors
 
-    private static readonly string[] SUPPORTED_EXTENSIONS = { ".fbx", ".obj", ".dae", ".mesh" };
+    private static readonly string[] SUPPORTED_EXTENSIONS = { ".fbx", ".obj", ".dae", ".mesh", ".asset" };
 
     /// <summary>Must match blender-bridge-injector default BRIDGE_BLENDER_PORT.</summary>
     private const int BridgeListenPort = 35971;
@@ -119,14 +119,22 @@ public static class BlenderBridgeProcessor
         }
 
         string modelFullPath;
-        if (extension == ".mesh")
+        if (extension == ".mesh" || extension == ".asset")
         {
-            if (!(obj is Mesh) && AssetDatabase.LoadAssetAtPath<Mesh>(assetPath) == null)
+            Mesh mesh = obj as Mesh;
+            if (mesh == null && extension == ".mesh")
+            {
+                mesh = AssetDatabase.LoadAssetAtPath<Mesh>(assetPath);
+            }
+
+            // Only intercept .asset files when the selected object itself is a Mesh.
+            // Other .asset types must keep their normal Unity open behavior.
+            if (mesh == null)
             {
                 return false;
             }
 
-            if (!BlenderBridgeUnityMesh.TryOpen(assetPath, out modelFullPath, out string meshError))
+            if (!BlenderBridgeUnityMesh.TryOpen(mesh, assetPath, out modelFullPath, out string meshError))
             {
                 Debug.LogError($"[BlenderBridge] {meshError}");
                 return true;

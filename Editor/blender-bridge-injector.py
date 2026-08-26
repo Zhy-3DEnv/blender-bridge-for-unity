@@ -34,7 +34,7 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.11"
+_BRIDGE_SCRIPT_VERSION = "2.12"
 _BRIDGE_MESH_SUFFIX = ".bridge-mesh"
 _BRIDGE_NORMAL_BASELINE_SUFFIX = ".normal-baseline"
 _BRIDGE_POSITION_EPSILON = 1e-5
@@ -914,6 +914,7 @@ def _write_bridge_normal_baseline(filepath: str, data: dict) -> None:
     baseline = {
         "version": 1,
         "unity_asset_path": data.get("unity_asset_path") or "",
+        "unity_mesh_local_id": int(data.get("unity_mesh_local_id") or 0),
         "name": data.get("name") or "",
         "vertex_count": data.get("vertex_count") or 0,
         "vertices": data.get("vertices") or [],
@@ -1349,9 +1350,10 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
             submesh_index_counts.append(len(tris) * 3)
 
         payload = {
-            "version": 2,
+            "version": 3,
             "name": existing.get("name") or target.name,
             "unity_asset_path": existing.get("unity_asset_path") or "",
+            "unity_mesh_local_id": int(existing.get("unity_mesh_local_id") or 0),
             "vertex_count": len(out_vertex_tuples),
             "vertices": vertices,
             "normals": normals,

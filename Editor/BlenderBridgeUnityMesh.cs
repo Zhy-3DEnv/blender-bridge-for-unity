@@ -3,11 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using Unity.Collections;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
-/// Round-trip Unity Mesh (.mesh) assets through Blender via a lossless JSON interchange file
+/// Round-trip Unity Mesh (.mesh or .asset) assets through Blender via a JSON interchange file
 /// (Library/BlenderBridge/*.bridge-mesh). Unity decompresses Mesh API data; Blender never
 /// parses Unity's CompressedMesh YAML.
 /// </summary>
@@ -16,9 +18,11 @@ public static class BlenderBridgeUnityMesh
 {
     public const string InterchangeExtension = ".bridge-mesh";
 
-    private const int BridgeMeshVersion = 2;
+    private const int BridgeMeshVersion = 3;
     private static readonly Dictionary<string, string> PendingByInterchange =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, long> PendingLocalIdByInterchange =
+        new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
 
     private static FileSystemWatcher _watcher;
     private static readonly object WatcherLock = new object();
@@ -35,41 +39,45 @@ public static class BlenderBridgeUnityMesh
 
     public static bool TryOpen(string assetPath, out string interchangeFullPath, out string error)
     {
+        return TryOpen(
+            AssetDatabase.LoadAssetAtPath<Mesh>(assetPath),
+            assetPath,
+            out interchangeFullPath,
+            out error);
+    }
+
+    public static bool TryOpen(
+        Mesh mesh,
+        string assetPath,
+        out string interchangeFullPath,
+        out string error)
+    {
         interchangeFullPath = null;
         error = null;
 
-        Mesh mesh = AssetDatabase.LoadAssetAtPath<Mesh>(assetPath);
         if (mesh == null)
         {
             error = $"Not a Mesh asset: '{assetPath}'";
             return false;
         }
 
-        if (!mesh.isReadable)
+        if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(mesh, out string _, out long localId))
         {
-            error =
-                $"Mesh '{assetPath}' is not readable (Read/Write Off). " +
-                "Enable Read/Write on the mesh asset before editing in Blender.";
+            error = $"Could not identify Mesh '{mesh.name}' in asset '{assetPath}'.";
             return false;
         }
 
         try
         {
-            Vector3[] vertices = mesh.vertices;
-            if (vertices == null || vertices.Length == 0)
-            {
-                error = $"Mesh '{assetPath}' has no vertices.";
-                return false;
-            }
-
-            interchangeFullPath = GetInterchangePath(assetPath);
+            BridgeMeshData data = CaptureMesh(mesh, assetPath, localId);
+            interchangeFullPath = GetInterchangePath(assetPath, mesh.name, localId);
             Directory.CreateDirectory(Path.GetDirectoryName(interchangeFullPath));
 
-            BridgeMeshData data = CaptureMesh(mesh, assetPath);
             WriteInterchange(interchangeFullPath, data);
 
             string normalized = NormalizePath(interchangeFullPath);
             PendingByInterchange[normalized] = assetPath;
+            PendingLocalIdByInterchange[normalized] = localId;
             // Ignore watcher events from this export for a short window.
             IgnoreWriteBackUntil[normalized] = EditorApplication.timeSinceStartup + 1.5;
             EnsureWatcher(Path.GetDirectoryName(interchangeFullPath));
@@ -88,51 +96,118 @@ public static class BlenderBridgeUnityMesh
             && path.EndsWith(InterchangeExtension, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static BridgeMeshData CaptureMesh(Mesh mesh, string assetPath)
+    private static BridgeMeshData CaptureMesh(Mesh mesh, string assetPath, long localId)
     {
-        Vector3[] vertices = mesh.vertices;
-        Vector3[] normals = mesh.normals;
-        int[] triangles = mesh.triangles;
-
-        var data = new BridgeMeshData
+        using (Mesh.MeshDataArray meshDataArray = MeshUtility.AcquireReadOnlyMeshData(mesh))
         {
-            version = BridgeMeshVersion,
-            name = string.IsNullOrEmpty(mesh.name) ? Path.GetFileNameWithoutExtension(assetPath) : mesh.name,
-            unity_asset_path = assetPath.Replace('\\', '/'),
-            vertex_count = vertices.Length,
-            vertices = Flatten(vertices),
-            normals = normals != null && normals.Length == vertices.Length ? Flatten(normals) : Array.Empty<float>(),
-            uvs = CaptureUvChannel(mesh, 0, vertices.Length),
-            uvs2 = CaptureUvChannel(mesh, 1, vertices.Length),
-            uvs3 = CaptureUvChannel(mesh, 2, vertices.Length),
-            uvs4 = CaptureUvChannel(mesh, 3, vertices.Length),
-            uvs5 = CaptureUvChannel(mesh, 4, vertices.Length),
-            uvs6 = CaptureUvChannel(mesh, 5, vertices.Length),
-            uvs7 = CaptureUvChannel(mesh, 6, vertices.Length),
-            uvs8 = CaptureUvChannel(mesh, 7, vertices.Length),
-            triangles = triangles ?? Array.Empty<int>(),
-            submesh_count = mesh.subMeshCount,
-            submesh_index_counts = new int[mesh.subMeshCount]
-        };
+            Mesh.MeshData meshData = meshDataArray[0];
+            int vertexCount = meshData.vertexCount;
+            if (vertexCount == 0)
+            {
+                throw new InvalidOperationException($"Mesh '{assetPath}' has no vertices.");
+            }
 
-        for (int i = 0; i < mesh.subMeshCount; i++)
-        {
-            data.submesh_index_counts[i] = (int)mesh.GetIndexCount(i);
+            Vector3[] vertices = CaptureVertices(meshData);
+            Vector3[] normals = CaptureNormals(meshData, vertexCount);
+            int[] submeshIndexCounts;
+            int[] triangles = CaptureTriangles(meshData, out submeshIndexCounts);
+
+            return new BridgeMeshData
+            {
+                version = BridgeMeshVersion,
+                name = string.IsNullOrEmpty(mesh.name) ? Path.GetFileNameWithoutExtension(assetPath) : mesh.name,
+                unity_asset_path = assetPath.Replace('\\', '/'),
+                unity_mesh_local_id = localId,
+                vertex_count = vertexCount,
+                vertices = Flatten(vertices),
+                normals = normals.Length == vertexCount ? Flatten(normals) : Array.Empty<float>(),
+                uvs = CaptureUvChannel(meshData, 0, vertexCount),
+                uvs2 = CaptureUvChannel(meshData, 1, vertexCount),
+                uvs3 = CaptureUvChannel(meshData, 2, vertexCount),
+                uvs4 = CaptureUvChannel(meshData, 3, vertexCount),
+                uvs5 = CaptureUvChannel(meshData, 4, vertexCount),
+                uvs6 = CaptureUvChannel(meshData, 5, vertexCount),
+                uvs7 = CaptureUvChannel(meshData, 6, vertexCount),
+                uvs8 = CaptureUvChannel(meshData, 7, vertexCount),
+                triangles = triangles,
+                submesh_count = meshData.subMeshCount,
+                submesh_index_counts = submeshIndexCounts
+            };
         }
-
-        return data;
     }
 
-    private static float[] CaptureUvChannel(Mesh mesh, int channel, int vertexCount)
+    private static Vector3[] CaptureVertices(Mesh.MeshData meshData)
     {
-        var uvs = new List<Vector2>(vertexCount);
-        mesh.GetUVs(channel, uvs);
-        if (uvs.Count != vertexCount)
+        using (var vertices = new NativeArray<Vector3>(meshData.vertexCount, Allocator.Temp))
+        {
+            meshData.GetVertices(vertices);
+            return vertices.ToArray();
+        }
+    }
+
+    private static Vector3[] CaptureNormals(Mesh.MeshData meshData, int vertexCount)
+    {
+        if (!meshData.HasVertexAttribute(VertexAttribute.Normal))
+        {
+            return Array.Empty<Vector3>();
+        }
+
+        using (var normals = new NativeArray<Vector3>(vertexCount, Allocator.Temp))
+        {
+            meshData.GetNormals(normals);
+            return normals.ToArray();
+        }
+    }
+
+    private static int[] CaptureTriangles(Mesh.MeshData meshData, out int[] submeshIndexCounts)
+    {
+        submeshIndexCounts = new int[meshData.subMeshCount];
+        int totalIndexCount = 0;
+        for (int i = 0; i < meshData.subMeshCount; i++)
+        {
+            SubMeshDescriptor submesh = meshData.GetSubMesh(i);
+            if (submesh.topology != MeshTopology.Triangles)
+            {
+                throw new InvalidOperationException(
+                    $"Submesh {i} uses unsupported topology '{submesh.topology}'. Only triangles are supported.");
+            }
+
+            submeshIndexCounts[i] = submesh.indexCount;
+            totalIndexCount += submesh.indexCount;
+        }
+
+        int[] triangles = new int[totalIndexCount];
+        int offset = 0;
+        for (int i = 0; i < meshData.subMeshCount; i++)
+        {
+            int count = submeshIndexCounts[i];
+            using (var indices = new NativeArray<int>(count, Allocator.Temp))
+            {
+                meshData.GetIndices(indices, i);
+                for (int j = 0; j < count; j++)
+                {
+                    triangles[offset + j] = indices[j];
+                }
+            }
+            offset += count;
+        }
+
+        return triangles;
+    }
+
+    private static float[] CaptureUvChannel(Mesh.MeshData meshData, int channel, int vertexCount)
+    {
+        VertexAttribute attribute = (VertexAttribute)((int)VertexAttribute.TexCoord0 + channel);
+        if (!meshData.HasVertexAttribute(attribute))
         {
             return Array.Empty<float>();
         }
 
-        return Flatten(uvs.ToArray());
+        using (var uvs = new NativeArray<Vector2>(vertexCount, Allocator.Temp))
+        {
+            meshData.GetUVs(channel, uvs);
+            return Flatten(uvs.ToArray());
+        }
     }
 
     private static void WriteInterchange(string path, BridgeMeshData data)
@@ -147,18 +222,21 @@ public static class BlenderBridgeUnityMesh
         return JsonUtility.FromJson<BridgeMeshData>(json);
     }
 
-    private static string GetInterchangePath(string assetPath)
+    private static string GetInterchangePath(string assetPath, string meshName, long localId)
     {
         string projectRoot = Path.GetDirectoryName(Application.dataPath);
         string dir = Path.Combine(projectRoot, "Library", "BlenderBridge");
         string hash;
         using (SHA1 sha = SHA1.Create())
         {
-            byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(assetPath.Replace('\\', '/')));
+            string meshIdentity = assetPath.Replace('\\', '/') + "|" + localId;
+            byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(meshIdentity));
             hash = BitConverter.ToString(bytes).Replace("-", "").Substring(0, 12).ToLowerInvariant();
         }
 
-        string safeName = Path.GetFileNameWithoutExtension(assetPath);
+        string safeName = string.IsNullOrEmpty(meshName)
+            ? Path.GetFileNameWithoutExtension(assetPath)
+            : meshName;
         foreach (char c in Path.GetInvalidFileNameChars())
         {
             safeName = safeName.Replace(c, '_');
@@ -291,20 +369,26 @@ public static class BlenderBridgeUnityMesh
                 return;
             }
 
-            Mesh mesh = AssetDatabase.LoadAssetAtPath<Mesh>(assetPath);
+            long localId = data.unity_mesh_local_id;
+            if (localId == 0)
+            {
+                PendingLocalIdByInterchange.TryGetValue(normalized, out localId);
+            }
+
+            Mesh mesh = ResolveMesh(assetPath, localId);
             if (mesh == null)
             {
-                Debug.LogError($"[BlenderBridge] Mesh asset missing: '{assetPath}'");
+                Debug.LogError(
+                    $"[BlenderBridge] Mesh asset missing: '{assetPath}' " +
+                    $"(local file ID {localId})");
                 return;
             }
 
-            if (!mesh.isReadable)
-            {
-                Debug.LogError($"[BlenderBridge] Cannot write back; mesh not readable: '{assetPath}'");
-                return;
-            }
-
+            // In Edit Mode Unity permits Mesh writes even when the importer's
+            // Read/Write option is disabled. The old explicit isReadable guard
+            // was what prevented these assets from round-tripping.
             ApplyBridgeDataToMesh(mesh, data);
+
             EditorUtility.SetDirty(mesh);
             AssetDatabase.SaveAssets();
             Debug.Log(
@@ -322,6 +406,32 @@ public static class BlenderBridgeUnityMesh
     private static bool HasUv(float[] uvs, int vertexCount)
     {
         return uvs != null && vertexCount > 0 && uvs.Length == vertexCount * 2;
+    }
+
+    private static Mesh ResolveMesh(string assetPath, long localId)
+    {
+        if (localId != 0)
+        {
+            UnityEngine.Object[] assets = AssetDatabase.LoadAllAssetsAtPath(assetPath);
+            foreach (UnityEngine.Object asset in assets)
+            {
+                if (!(asset is Mesh candidate))
+                {
+                    continue;
+                }
+
+                if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(
+                        candidate,
+                        out string _,
+                        out long candidateLocalId)
+                    && candidateLocalId == localId)
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        return AssetDatabase.LoadAssetAtPath<Mesh>(assetPath);
     }
 
     private static void ApplyBridgeDataToMesh(Mesh mesh, BridgeMeshData data)
@@ -495,6 +605,7 @@ public static class BlenderBridgeUnityMesh
         public int version;
         public string name;
         public string unity_asset_path;
+        public long unity_mesh_local_id;
         public int vertex_count;
         public float[] vertices;
         public float[] normals;

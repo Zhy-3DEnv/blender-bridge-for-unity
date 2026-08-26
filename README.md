@@ -4,9 +4,9 @@
 
 ---
 
-Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
+Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh` / `.asset`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
 
-**Version:** 0.1.10 · **Unity:** 2022.3+ · **Platform:** Windows
+**Version:** 0.1.11 · **Unity:** 2022.3+ · **Platform:** Windows
 
 ## Installing
 
@@ -22,14 +22,14 @@ Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Uni
 ## Quick start
 
 1. Set your Blender executable path in **Edit > Project Settings > Blender Bridge** (see [Configuration](#configuration)).
-2. Double-click an `.fbx`, `.obj`, `.dae`, or `.mesh` asset in the Unity Project window.
+2. Double-click an `.fbx`, `.obj`, `.dae`, `.mesh`, or Mesh `.asset` in the Unity Project window.
 3. Edit the model in Blender.
 4. Press **Ctrl+S** or use **File → Export → … (back to original Unity asset)** to write back to Unity.
 
 ## Features
 
 - **Double-click to edit** — open supported 3D assets directly from the Unity Project window
-- **Unity Mesh (.mesh)** — opens readable Mesh assets via a lossless JSON interchange under `Library/BlenderBridge/` (handles Unity CompressedMesh by reading through the Mesh API)
+- **Unity Mesh (.mesh / .asset)** — opens Mesh assets through a JSON interchange under `Library/BlenderBridge/`, including meshes with Read/Write disabled
 - **Hot reuse** — if Blender is already running, the next double-click imports into the same window instead of launching another instance
 - **Auto focus** — when hot-reusing Blender, the window is brought to the foreground automatically
 - **Save back to Unity** — Ctrl+S and the File → Export menu export to the original asset path
@@ -87,10 +87,11 @@ TEXTURE_PATH = r"C:\path\to\your\textures"
 
 Textures are matched by material name + extension (`.png`, `.jpg`, etc.).
 
-### Unity Mesh (`.mesh`) requirements
+### Unity Mesh (`.mesh` / `.asset`) requirements
 
-- The Mesh asset must be **Read/Write Enabled** (`isReadable`).
-- Double-clicking a `.mesh` writes a temporary `Library/BlenderBridge/*.bridge-mesh` interchange file, opens it in Blender, and on Ctrl+S writes geometry back into the original Mesh asset.
+- Read/Write can be enabled or disabled. The bridge uses Unity's editor-only MeshData API for non-readable meshes without changing their importer setting.
+- For `.asset` files, Blender Bridge activates only when the selected object is a `Mesh`; other `.asset` types keep Unity's normal behavior.
+- Double-clicking a Mesh writes a temporary `Library/BlenderBridge/*.bridge-mesh` interchange file, opens it in Blender, and on Ctrl+S writes geometry back into that exact Mesh object.
 - Unity CompressedMesh YAML is never parsed by Blender; Unity decompresses via the Mesh API.
 - When a face's normal is flipped in Blender, unchanged vertices keep their original Unity normals; only the flipped face's shared vertices are split so adjacent faces keep their previous shading.
 
@@ -135,9 +136,9 @@ MIT
 
 # Blender Bridge（中文）
 
-在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
+在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh` / `.asset`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
 
-**版本：** 0.1.10 · **Unity：** 2022.3+ · **平台：** Windows
+**版本：** 0.1.11 · **Unity：** 2022.3+ · **平台：** Windows
 
 ## 安装
 
@@ -153,14 +154,14 @@ MIT
 ## 快速上手
 
 1. 在 Unity 的 **Edit > Project Settings > Blender Bridge** 中设置 Blender 可执行文件路径（见 [配置说明](#配置说明)）。
-2. 在 Unity **Project** 窗口双击 `.fbx`、`.obj`、`.dae` 或 `.mesh` 资产。
+2. 在 Unity **Project** 窗口双击 `.fbx`、`.obj`、`.dae`、`.mesh` 或 Mesh 类型的 `.asset` 资产。
 3. 在 Blender 中编辑模型。
 4. 按 **Ctrl+S**，或使用 **File → Export → … (back to original Unity asset)** 导出回 Unity。
 
 ## 功能特性
 
 - **双击编辑** — 从 Unity 工程窗口直接打开支持的 3D 资产
-- **Unity Mesh（.mesh）** — 支持可读 Mesh 资产；通过 `Library/BlenderBridge/` 下的 JSON 中转文件往返（Unity CompressedMesh 由 Mesh API 解压，Blender 不直接解析 YAML）
+- **Unity Mesh（.mesh / .asset）** — 通过 `Library/BlenderBridge/` 下的 JSON 中转文件往返，也支持未开启 Read/Write 的 Mesh
 - **热复用** — Blender 已在运行时，再次双击会导入到同一窗口，不会重复启动新实例
 - **自动置前** — 热复用导入时，Blender 窗口会自动弹到最前面
 - **保存回 Unity** — Ctrl+S 和导出菜单都会写回原资产路径
@@ -216,10 +217,11 @@ TEXTURE_PATH = r"C:\path\to\your\textures"
 
 贴图按 **材质名 + 扩展名**（`.png`、`.jpg` 等）匹配。
 
-### Unity Mesh（`.mesh`）要求
+### Unity Mesh（`.mesh` / `.asset`）要求
 
-- Mesh 资产必须开启 **Read/Write Enabled**（`isReadable`）。
-- 双击 `.mesh` 时，会在 `Library/BlenderBridge/` 生成 JSON 中转文件 `*.bridge-mesh` 并在 Blender 中打开；Ctrl+S 后把几何写回原 Mesh 资产。
+- 无论是否开启 **Read/Write Enabled** 均可处理；未开启时使用 Unity 编辑器专用 MeshData API，不会修改原导入设置。
+- 对于 `.asset` 文件，仅当所选对象本身是 `Mesh` 时才由 Blender Bridge 接管，其他 `.asset` 类型保持 Unity 原有行为。
+- 双击 Mesh 时，会在 `Library/BlenderBridge/` 生成 JSON 中转文件 `*.bridge-mesh` 并在 Blender 中打开；Ctrl+S 后把几何精确写回该 Mesh 对象。
 - Blender 不直接解析 Unity CompressedMesh YAML，而是由 Unity Mesh API 解压后再中转。
 - 在 Blender 中翻转某个面的法线时，未改动的顶点会保留原有 Unity 法线；仅被翻转面共用的顶点会被拆分，从而让相邻面的原有光照保持不变。
 
