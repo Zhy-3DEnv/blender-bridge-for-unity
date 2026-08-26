@@ -6,7 +6,7 @@
 
 Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Unity, then export straight back to the original asset. Ctrl+S in Blender is overridden so saving writes to the Unity project file instead of a `.blend`.
 
-**Version:** 0.1.9 · **Unity:** 2022.3+ · **Platform:** Windows
+**Version:** 0.1.10 · **Unity:** 2022.3+ · **Platform:** Windows
 
 ## Installing
 
@@ -21,7 +21,7 @@ Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Uni
 
 ## Quick start
 
-1. Set your Blender executable path in `Editor/BlenderBridgeProcessor.cs` (see [Configuration](#configuration)).
+1. Set your Blender executable path in **Edit > Project Settings > Blender Bridge** (see [Configuration](#configuration)).
 2. Double-click an `.fbx`, `.obj`, `.dae`, or `.mesh` asset in the Unity Project window.
 3. Edit the model in Blender.
 4. Press **Ctrl+S** or use **File → Export → … (back to original Unity asset)** to write back to Unity.
@@ -50,21 +50,17 @@ Open `.FBX`, `.OBJ`, `.DAE`, and Unity Mesh (`.mesh`) assets in Blender from Uni
 | Requirement          | Notes                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------- |
 | **Windows**          | Editor integration uses Windows process and window APIs                                                   |
-| **Blender 5.x**      | Default path targets Blender 5.1; other versions work if you update the path                              |
+| **Blender 5.x**      | Default path targets Blender 5.1; other versions can be selected in Project Settings                     |
 | **Better FBX addon** | Strongly recommended for FBX (especially ASCII FBX and correct normals). Built-in FBX is used as fallback |
 
 
 ## Configuration
 
-There is no Unity Preferences panel yet. Edit the source files below.
+Project-level options are available under **Edit > Project Settings > Blender Bridge**. The remaining advanced options are documented below.
 
 ### Blender executable path
 
-In `Editor/BlenderBridgeProcessor.cs`, set `BLENDER_PATH` to your Blender install:
-
-```csharp
-private static readonly string BLENDER_PATH = @"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe";
-```
+In Unity, open **Edit > Project Settings > Blender Bridge** and select your Blender executable. The setting is saved per project in `ProjectSettings/BlenderBridgeSettings.asset`.
 
 Common locations:
 
@@ -141,7 +137,7 @@ MIT
 
 在 Unity 中双击 `.FBX`、`.OBJ`、`.DAE`、Unity Mesh（`.mesh`）资产即可用 Blender 打开编辑；保存时直接写回 Unity 项目里的原文件，而不是存成 `.blend`。Blender 中的 **Ctrl+S** 已被桥接脚本接管。
 
-**版本：** 0.1.9 · **Unity：** 2022.3+ · **平台：** Windows
+**版本：** 0.1.10 · **Unity：** 2022.3+ · **平台：** Windows
 
 ## 安装
 
@@ -156,7 +152,7 @@ MIT
 
 ## 快速上手
 
-1. 在 `Editor/BlenderBridgeProcessor.cs` 中设置 Blender 可执行文件路径（见 [配置说明](#配置说明)）。
+1. 在 Unity 的 **Edit > Project Settings > Blender Bridge** 中设置 Blender 可执行文件路径（见 [配置说明](#配置说明)）。
 2. 在 Unity **Project** 窗口双击 `.fbx`、`.obj`、`.dae` 或 `.mesh` 资产。
 3. 在 Blender 中编辑模型。
 4. 按 **Ctrl+S**，或使用 **File → Export → … (back to original Unity asset)** 导出回 Unity。
@@ -183,21 +179,17 @@ MIT
 | 要求                | 说明                                        |
 | ----------------- | ----------------------------------------- |
 | **Windows**       | 编辑器集成依赖 Windows 进程与窗口 API                 |
-| **Blender 5.x**   | 默认路径为 Blender 5.1；其他版本需手动修改路径             |
+| **Blender 5.x**   | 默认路径为 Blender 5.1；其他版本可在 Project Settings 中选择 |
 | **Better FBX 插件** | 强烈建议安装（ASCII FBX 与法线一致性尤其需要）；未安装时使用内置 FBX |
 
 
 ## 配置说明
 
-目前没有 Unity 偏好设置面板，需直接修改源码。
+项目级选项位于 **Edit > Project Settings > Blender Bridge**，其余高级选项见下文。
 
 ### Blender 可执行文件路径
 
-在 `Editor/BlenderBridgeProcessor.cs` 中修改 `BLENDER_PATH`：
-
-```csharp
-private static readonly string BLENDER_PATH = @"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe";
-```
+在 Unity 中打开 **Edit > Project Settings > Blender Bridge**，选择 Blender 可执行文件。该设置会按项目保存在 `ProjectSettings/BlenderBridgeSettings.asset`。
 
 常见路径：
 

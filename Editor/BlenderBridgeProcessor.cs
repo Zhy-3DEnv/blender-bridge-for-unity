@@ -14,7 +14,6 @@ public static class BlenderBridgeProcessor
 {
     private static readonly bool DEBUG = false; // If false it'll only log errors
 
-    private static readonly string BLENDER_PATH = @"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe";
     private static readonly string[] SUPPORTED_EXTENSIONS = { ".fbx", ".obj", ".dae", ".mesh" };
 
     /// <summary>Must match blender-bridge-injector default BRIDGE_BLENDER_PORT.</summary>
@@ -177,9 +176,12 @@ public static class BlenderBridgeProcessor
                 $"[BlenderBridge] No listener on 127.0.0.1:{BridgeListenPort}; launching Blender. Injector: {py}");
         }
 
-        if (!File.Exists(BLENDER_PATH))
+        string blenderPath = BlenderBridgeSettings.instance.BlenderExecutablePath;
+        if (!File.Exists(blenderPath))
         {
-            Debug.LogError($"Blender not found at {BLENDER_PATH}.");
+            Debug.LogError(
+                $"[BlenderBridge] Blender not found at '{blenderPath}'. " +
+                "Set the executable path in Edit > Project Settings > Blender Bridge.");
             return;
         }
 
@@ -197,7 +199,7 @@ public static class BlenderBridgeProcessor
         {
             Debug.Log($"[BlenderBridge] Launching Blender with model: '{modelFullPath}'");
         }
-        StartBlenderWithArguments(arguments, pythonScript);
+        StartBlenderWithArguments(blenderPath, arguments, pythonScript);
     }
 
     /// <summary>
@@ -436,12 +438,15 @@ public static class BlenderBridgeProcessor
     private static extern uint GetCurrentThreadId();
 #endif
 
-    private static void StartBlenderWithArguments(string arguments, string injectorScriptPath)
+    private static void StartBlenderWithArguments(
+        string blenderPath,
+        string arguments,
+        string injectorScriptPath)
     {
         System.Diagnostics.Process process = new System.Diagnostics.Process();
         System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = BLENDER_PATH,
+            FileName = blenderPath,
             UseShellExecute = false,
             // Never redirect stdout/stderr without draining: Blender + Python can block when the pipe buffer fills,
             // which prevents the reuse TCP server from starting.
