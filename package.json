@@ -2,7 +2,7 @@
     "name": "com.simoxus.blender-bridge",
     "displayName": "Blender Bridge",
     "description": "Open .FBX, .OBJ, .DAE, and Unity Mesh assets in Blender, then save edits back to Unity",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "unity": "2022.3",
     "license": "MIT",
     "author": {

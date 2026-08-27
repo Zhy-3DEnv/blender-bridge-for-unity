@@ -34,7 +34,7 @@ _FORCE_BETTER_FBX_IMPORT = os.environ.get("BRIDGE_FORCE_BETTER_FBX_IMPORT", "").
 _FORCE_BUILTIN_FBX_EXPORT = os.environ.get("BRIDGE_FORCE_BUILTIN_FBX_EXPORT", "").lower() in ("1", "true", "yes")
 _VALID_BETTER_EXPORT_AXES = frozenset({"MayaZUp", "OpenGL", "Unity", "Unreal1", "Unreal2"})
 _VALID_BETTER_IMPORT_EDGE_SMOOTHING = frozenset({"None", "Import", "FBXSDK", "Blender"})
-_BRIDGE_SCRIPT_VERSION = "2.12"
+_BRIDGE_SCRIPT_VERSION = "2.13"
 _BRIDGE_MESH_SUFFIX = ".bridge-mesh"
 _BRIDGE_NORMAL_BASELINE_SUFFIX = ".normal-baseline"
 _BRIDGE_POSITION_EPSILON = 1e-5
@@ -752,6 +752,18 @@ def _is_bridge_mesh_path(path: str) -> bool:
     return path.lower().endswith(_BRIDGE_MESH_SUFFIX)
 
 
+def _unity_to_blender_xyz(values) -> tuple[float, float, float]:
+    """Rotate Unity Y-up coordinates +90 degrees around X into Blender Z-up."""
+    x, y, z = values
+    return (float(x), -float(z), float(y))
+
+
+def _blender_to_unity_xyz(values) -> tuple[float, float, float]:
+    """Inverse of _unity_to_blender_xyz; restore Unity Y-up coordinates."""
+    x, y, z = values
+    return (float(x), float(z), -float(y))
+
+
 def _resolve_model_format(path: str) -> str:
     if _is_bridge_mesh_path(path):
         return _BRIDGE_MESH_SUFFIX
@@ -813,7 +825,9 @@ def _import_unity_bridge_mesh(path: str) -> bool:
 
     vertex_count = len(verts_flat) // 3
     vertices = [
-        (verts_flat[i * 3], verts_flat[i * 3 + 1], verts_flat[i * 3 + 2])
+        _unity_to_blender_xyz(
+            (verts_flat[i * 3], verts_flat[i * 3 + 1], verts_flat[i * 3 + 2])
+        )
         for i in range(vertex_count)
     ]
 
@@ -844,10 +858,12 @@ def _import_unity_bridge_mesh(path: str) -> bool:
             for loop in mesh.loops:
                 vi = loop.vertex_index
                 loop_normals.append(
-                    (
-                        normals_flat[vi * 3],
-                        normals_flat[vi * 3 + 1],
-                        normals_flat[vi * 3 + 2],
+                    _unity_to_blender_xyz(
+                        (
+                            normals_flat[vi * 3],
+                            normals_flat[vi * 3 + 1],
+                            normals_flat[vi * 3 + 2],
+                        )
                     )
                 )
             mesh.normals_split_custom_set(loop_normals)
@@ -1153,11 +1169,14 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
     try:
         mesh.calc_loop_triangles()
 
-        # Preserve Unity coordinates: use object-local mesh data (no axis conversion).
+        # Work in Unity coordinates from this point onward so baseline matching,
+        # normal preservation, and the JSON payload remain unchanged.
         current_vertices = []
         for v in mesh.vertices:
             co = v.co
-            current_vertices.append((float(co.x), float(co.y), float(co.z)))
+            current_vertices.append(
+                _blender_to_unity_xyz((float(co.x), float(co.y), float(co.z)))
+            )
 
         # Preserve UV layer order: UVMap/first -> uvs, UV2/second -> uvs2, ...
         current_uv_flats = []
@@ -1168,7 +1187,10 @@ def _export_unity_bridge_mesh(filepath: str) -> None:
 
         current_tri_objects = list(mesh.loop_triangles)
         current_tri_tuples = [tuple(int(v) for v in tri.vertices) for tri in current_tri_objects]
-        current_avg_normals = _average_loop_normals_per_vertex(mesh)
+        current_avg_normals = [
+            _blender_to_unity_xyz(normal)
+            for normal in _average_loop_normals_per_vertex(mesh)
+        ]
 
         baseline = _read_bridge_normal_baseline(filepath)
         orientation_flags = None
@@ -1620,7 +1642,7 @@ def menu_func_export(self, context):
     if "unity_model_path" in context.scene:
         file_format = context.scene.get("unity_model_format", ".fbx")
         if file_format == _BRIDGE_MESH_SUFFIX:
-            label = "Unity Mesh (back to original .mesh asset)"
+            label = "Unity Mesh (back to original .mesh / .asset)"
         else:
             label = f"{str(file_format)[1:].upper()} (back to original Unity asset)"
         self.layout.operator(
